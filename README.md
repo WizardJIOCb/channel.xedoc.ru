@@ -29,6 +29,8 @@ MAX_APP_BOT_USERNAME=se13980695_bot
 
 At startup the service registers the command menu and the protected webhook `https://channel.xedoc.ru/webhooks/max/app`. The bot supports `/start`, `/cabinet`, `/connect`, `/status`, and `/help`. Do not put the token into a chat, repository, or browser URL.
 
+If a MAX token is rotated, replace it for the existing repost direction using the “Заменить токен MAX” form on the connection card. The token is sealed before it is saved and its webhook subscription is refreshed automatically.
+
 ## Development check
 
 ```powershell
