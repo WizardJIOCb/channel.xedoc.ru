@@ -31,7 +31,7 @@ async function save() { writing = writing.then(async () => { await mkdir(dirname
 
 async function init() {
   try { store = { ...store, ...JSON.parse(await readFile(env.file, 'utf8')) }; } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  store.users ||= []; store.sessions ||= []; store.connections ||= [];
+  store.users ||= []; store.sessions ||= []; store.connections ||= []; store.history ||= [];
   if (!store.migrated && env.legacy.tg && env.legacy.max) {
     store.connections.push({ id: rid(), userId: null, name: 'Лось в проде', source: env.legacy.source, telegramToken: seal(env.legacy.tg), telegramSecret: env.legacy.tgSecret, maxToken: seal(env.legacy.max), maxSecret: env.legacy.maxSecret, targetChatId: env.legacy.target || null, enabled: true, error: null, createdAt: stamp(), updatedAt: stamp() });
     store.migrated = true; await save();
@@ -97,6 +97,62 @@ const server = createServer(async (request, response) => { const url = new URL(r
 home = function home(value) {
   const action = value ? '<a class="button" href="/dashboard">Открыть кабинет</a>' : '<a class="button" href="/register">Начать бесплатно</a><a class="button secondary" href="/login">Войти</a>';
   return page('Автопостинг', `<style>.hero-grid{grid-template-columns:minmax(0,1.08fr) minmax(400px,.92fr)}.hero-copy h1{font-size:clamp(38px,3.75vw,51px);letter-spacing:-.052em;white-space:nowrap}.hero-copy .lead{font-size:17px}@media(max-width:600px){.hero-copy h1{font-size:40px;white-space:normal}}</style><main class="landing"><section class="hero-grid"><div class="hero-copy"><p class="eyebrow"><i></i>Автопостинг для каналов</p><h1>Публикуйте один раз.<br><span>Будьте везде.</span></h1><p class="lead">Multi Post переносит новые публикации из Telegram в MAX: текст, ссылки и медиа — без ручной работы.</p><div class="hero-actions">${action}</div><div class="trust"><span><b>✓</b> Токены зашифрованы</span><span><b>✓</b> Каналы изолированы</span><span><b>✓</b> Webhook в реальном времени</span></div></div><div class="flow-card"><div class="flow-top">${mark(44)}<span class="online"><i></i>Готово к работе</span></div><div class="flow"><div class="route"><span class="route-icon telegram">✈</span><div class="route-body"><strong>Telegram</strong><span>Новый пост в вашем канале</span></div><span class="route-arrow">→</span></div><div class="route"><span class="route-icon max">M</span><div class="route-body"><strong>MAX</strong><span>Публикация выходит автоматически</span></div><span class="route-arrow">✓</span></div></div><div class="post-preview"><span>Новая публикация</span><p>Ссылка, текст и вложения доставлены в канал MAX</p></div></div></section></main><section class="features"><article class="feature"><span class="feature-icon">↗</span><h3>Одна настройка</h3><p>Добавьте ботов администраторами и создайте связку за несколько минут.</p></article><article class="feature"><span class="feature-icon">⌁</span><h3>Без потери ссылок</h3><p>Ссылки и базовое форматирование Telegram остаются кликабельными в MAX.</p></article><article class="feature"><span class="feature-icon">◈</span><h3>Всё под контролем</h3><p>В кабинете видны статусы подключений; репост можно остановить одним нажатием.</p></article></section>`, value);
+};
+
+function postPreview(message) { return (textOf(message).replace(/\s+/g, ' ').trim() || 'Вложение без подписи').slice(0, 220); }
+function historyTime(value) { return new Intl.DateTimeFormat('ru-RU', { timeZone: 'Asia/Yekaterinburg', dateStyle: 'short', timeStyle: 'short' }).format(new Date(value)); }
+async function beginDelivery(connection, message) {
+  store.history ||= [];
+  const telegramMessageId = String(message.message_id || '');
+  let item = store.history.find((entry) => entry.connectionId === connection.id && entry.telegramMessageId === telegramMessageId);
+  if (!item) {
+    item = { id: rid(), connectionId: connection.id, telegramMessageId, source: connection.source, preview: postPreview(message), mediaType: fileOf(message)?.type || null, status: 'processing', attempts: 0, error: null, createdAt: stamp(), updatedAt: stamp(), deliveredAt: null };
+    store.history.unshift(item);
+  }
+  item.status = 'processing'; item.attempts += 1; item.error = null; item.updatedAt = stamp(); store.history = store.history.slice(0, 300);
+  await save(); return item;
+}
+async function finishDelivery(item, error = null) { item.status = error ? 'failed' : 'published'; item.error = error ? String(error.message || error).slice(0, 220) : null; item.updatedAt = stamp(); item.deliveredAt = error ? null : stamp(); await save(); }
+const sendUpload = upload;
+upload = async function uploadWithTokenFallback(connection, item) {
+  const telegramToken = unseal(connection.telegramToken); const maxToken = unseal(connection.maxToken);
+  const info = await (await fetch(`https://api.telegram.org/bot${telegramToken}/getFile?file_id=${encodeURIComponent(item.id)}`)).json();
+  if (!info.ok || !info.result?.file_path) throw new Error('Telegram file is unavailable');
+  const source = await fetch(`https://api.telegram.org/file/bot${telegramToken}/${info.result.file_path}`);
+  const endpoint = await fetch(`https://platform-api2.max.ru/uploads?type=${item.type}`, { method: 'POST', headers: { Authorization: maxToken } });
+  const address = await endpoint.json(); if (!endpoint.ok || !address.url) throw new Error('MAX upload URL failed');
+  const data = new FormData(); data.append('data', new Blob([await source.arrayBuffer()], { type: item.mime }), item.name);
+  const response = await fetch(address.url, { method: 'POST', body: data }); const body = await response.text();
+  if (!response.ok) throw new Error('MAX media upload failed');
+  let answer = {}; try { answer = JSON.parse(body); } catch { /* Some MAX upload hosts return a plain confirmation. */ }
+  let urlToken = null; try { const uploadUrl = new URL(address.url); urlToken = uploadUrl.searchParams.get('token') || uploadUrl.searchParams.get('apiToken'); } catch { /* URL is validated by MAX. */ }
+  const photoToken = Object.values(answer.photos || {}).map((photo) => photo?.token).find((value) => typeof value === 'string' && value.length > 0);
+  const token = [answer.token, answer.upload_token, answer.payload?.token, answer.result?.token, photoToken, address.token, urlToken].find((value) => typeof value === 'string' && value.length > 0);
+  if (!token) throw new Error(`MAX upload returned no token for ${item.type}`);
+  return { type: item.type, payload: { token } };
+};
+const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+async function publishWithRetries(connection, message) {
+  if (!connection.targetChatId) throw new Error('MAX channel has not been connected');
+  const original = textOf(message); const formatted = formatTelegram(original, tagsOf(message)); const useHtml = Boolean(formatted && formatted.length <= 4000);
+  const parts = useHtml ? [formatted] : split(original); const attachment = fileOf(message) ? await upload(connection, fileOf(message)) : null; const maxToken = unseal(connection.maxToken);
+  for (let index = 0; index < parts.length; index += 1) {
+    const payload = { text: parts[index], notify: true }; if (useHtml) payload.format = 'html'; if (index === 0 && attachment) payload.attachments = [attachment];
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const response = await fetch(`https://platform-api2.max.ru/messages?chat_id=${encodeURIComponent(connection.targetChatId)}`, { method: 'POST', headers: { Authorization: maxToken, 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+      if (response.ok) break;
+      const detail = await response.text(); const canRetry = response.status >= 500 || detail.includes('attachment.not.ready');
+      if (!canRetry || attempt === 3) throw new Error(`MAX rejected the post (${response.status})`);
+      await pause(1500 * (attempt + 1));
+    }
+  }
+}
+repost = async function repostWithHistory(connection, message) { const item = await beginDelivery(connection, message); try { const result = await publishWithRetries(connection, message); await finishDelivery(item); return result; } catch (error) { await finishDelivery(item, error); throw error; } };
+dashboard = function dashboardWithHistory(value, notice = '') {
+  const list = store.connections.filter((item) => item.userId === value.user.id);
+  const ids = new Set(list.map((item) => item.id)); const history = (store.history || []).filter((item) => ids.has(item.connectionId)).slice(0, 24);
+  const rows = history.length ? history.map((item) => { const label = item.status === 'published' ? 'Опубликован в MAX' : item.status === 'failed' ? 'Ошибка доставки' : 'В обработке'; const icon = item.status === 'published' ? '✓' : item.status === 'failed' ? '!' : '…'; return `<article class="history-row"><span class="history-state ${item.status}">${icon}</span><div class="history-copy"><div class="history-line"><strong>${esc(item.preview)}</strong><span class="history-status ${item.status}">${label}</span></div><p>${historyTime(item.updatedAt)} · @${esc(item.source)}${item.mediaType ? ` · ${esc(item.mediaType)}` : ''} · попыток: ${item.attempts}</p>${item.error ? `<p class="history-error">${esc(item.error)}</p>` : ''}<a href="https://t.me/${encodeURIComponent(item.source)}/${encodeURIComponent(item.telegramMessageId)}" target="_blank" rel="noreferrer">Открыть исходный пост ↗</a></div></article>`; }).join('') : '<p class="muted">История появится после первой попытки репоста.</p>';
+  return page('Кабинет', `<style>.history-panel{grid-column:1/-1}.history-list{display:grid;gap:10px}.history-row{display:flex;gap:12px;padding:14px 0;border-top:1px solid #edf0f5}.history-row:first-child{padding-top:0;border-top:0}.history-state{display:grid;place-items:center;flex:none;width:30px;height:30px;border-radius:50%;font-weight:900}.history-state.published{background:#e8fbf2;color:#168155}.history-state.failed{background:#fff0f2;color:#be4e63}.history-state.processing{background:#eef7ff;color:#258acb}.history-copy{min-width:0;flex:1}.history-line{display:flex;align-items:start;justify-content:space-between;gap:12px}.history-line strong{overflow:hidden;font-size:14px;text-overflow:ellipsis;white-space:nowrap}.history-copy p{margin:3px 0;color:#7a8399;font-size:12px}.history-copy a{color:#5c49d1;font-size:12px;font-weight:750;text-decoration:none}.history-status{flex:none;padding:4px 7px;border-radius:7px;font-size:11px;font-weight:800}.history-status.published{background:#e8fbf2;color:#168155}.history-status.failed{background:#fff0f2;color:#be4e63}.history-status.processing{background:#eef7ff;color:#258acb}.history-error{color:#b5495f!important}@media(max-width:600px){.history-line{display:block}.history-status{display:inline-block;margin-top:6px}.history-line strong{white-space:normal}}</style><main class="dashboard"><section class="dashboard-head"><div><p class="eyebrow"><i></i>Личный кабинет</p><h1>Ваши подключения</h1><p class="muted">Настраивайте направления репостов и следите за их состоянием.</p></div><a class="button" href="#new-connection">+ Новое подключение</a></section>${notice ? `<p class="notice">${esc(notice)}</p>` : ''}<section class="dashboard-grid"><article class="panel"><div class="panel-head"><h2>Активные направления</h2><span class="count">${list.length}</span></div><div class="connections">${list.length ? list.map((item) => connectionCard(item, value)).join('') : '<p class="muted">Подключений ещё нет. Создайте первое ниже.</p>'}</div></article><aside class="panel help-card"><h2>Как это работает</h2><p>Новая публикация из канала Telegram появляется в MAX автоматически.</p><ol><li>Добавьте Telegram-бота администратором исходного канала.</li><li>Добавьте MAX-бота администратором целевого канала.</li><li>Создайте подключение — остальное настроится само.</li></ol><details><summary>Не определился MAX-канал?</summary><p>Добавьте MAX-бота в канал после создания подключения или укажите ID канала вручную.</p></details></aside><article class="panel history-panel"><div class="panel-head"><div><h2>История репостов</h2><p class="small" style="margin:5px 0 0">Последние 24 попытки доставки по вашим каналам.</p></div><span class="count">${history.length}</span></div><div class="history-list">${rows}</div></article><article class="panel create-panel" id="new-connection"><div class="panel-head"><h2>Новое подключение</h2><span class="small">Шаг 1 из 1</span></div><div class="form-intro"><i>i</i><div><b>Подготовьте права ботов заранее.</b><br>Telegram-бот должен быть администратором исходного канала. MAX-бота можно добавить сразу после сохранения формы.</div></div><form method="post" action="/connections"><input type="hidden" name="csrf" value="${esc(value.session.csrf)}"><div class="form-grid"><label class="field"><span>Название подключения</span><input name="name" maxlength="80" required placeholder="Новости компании"></label><label class="field"><span>Исходный Telegram-канал</span><input name="source" maxlength="64" required placeholder="@my_channel"></label><label class="field"><span>Токен Telegram-бота</span><input name="telegramToken" type="password" autocomplete="off" required placeholder="Вставьте токен"></label><label class="field"><span>Токен MAX-бота</span><input name="maxToken" type="password" autocomplete="off" required placeholder="Вставьте токен"></label><label class="field wide"><span>ID канала MAX <em class="small">необязательно</em></span><input name="targetChatId" placeholder="Оставьте пустым — определится после добавления бота в MAX-канал"></label></div><div class="create-actions"><p class="small">Токены шифруются сразу после сохранения и не отображаются в кабинете.</p><button class="button">Создать подключение</button></div></form></article></section></main>`, value);
 };
 
 await init();
