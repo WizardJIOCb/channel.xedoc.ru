@@ -59,18 +59,21 @@ async function settlePayment(payment) { if (!payment || payment.credited || !pay
 function maxAppReady() { return Boolean(env.maxApp.token && env.maxApp.secret && env.maxApp.username); }
 function maxAppLink() { return env.maxApp.username ? `https://max.ru/${encodeURIComponent(env.maxApp.username)}?startapp` : `${env.baseUrl}/max`; }
 async function maxAppApi(path, options = {}) { const response = await fetch(`https://platform-api2.max.ru${path}`, { ...options, headers: { Authorization: env.maxApp.token, 'content-type': 'application/json', ...(options.headers || {}) } }); const body = await response.json().catch(() => ({})); if (!response.ok) throw new Error(body.message || `MAX API returned ${response.status}`); return body; }
-async function sendMaxAssistantMessage(chatId, text, withAppButton = false) { const payload = { text, format: 'markdown' }; if (withAppButton) payload.attachments = [{ type: 'inline_keyboard', payload: { buttons: [[{ type: 'link', text: 'Открыть Multi Post', url: maxAppLink() }]] } }]; return maxAppApi(`/messages?chat_id=${encodeURIComponent(chatId)}`, { method: 'POST', body: JSON.stringify(payload) }); }
+function maxAssistantRecipient(update) { const userId = update.user?.user_id || update.message?.sender?.user_id; const chatId = update.chat_id || update.message?.recipient?.chat_id; return userId ? { type: 'user_id', id: userId } : chatId ? { type: 'chat_id', id: chatId } : null; }
+async function sendMaxAssistantMessage(recipient, text, withAppButton = false) { if (!recipient?.id) return; const payload = { text, format: 'markdown' }; if (withAppButton) payload.attachments = [{ type: 'inline_keyboard', payload: { buttons: [[{ type: 'link', text: 'Открыть Multi Post', url: maxAppLink() }]] } }]; return maxAppApi(`/messages?${recipient.type}=${encodeURIComponent(recipient.id)}`, { method: 'POST', body: JSON.stringify(payload) }); }
 function maxAssistantText(update) { return [update.message?.body?.text, update.message?.text, update.message?.body?.message?.text].find((item) => typeof item === 'string')?.trim() || ''; }
 async function handleMaxAssistant(update) {
-  if (!maxAppReady() || !update?.chat_id) return;
-  if (update.update_type === 'bot_started') return sendMaxAssistantMessage(update.chat_id, 'Добро пожаловать в **Multi Post**. Здесь можно открыть кабинет, проверить состояние сервиса и настроить автопостинг.', true);
+  const recipient = maxAssistantRecipient(update);
+  if (!maxAppReady() || !recipient) return;
+  if (update.update_type === 'bot_started') return sendMaxAssistantMessage(recipient, 'Добро пожаловать в **Multi Post**. Здесь можно открыть кабинет, проверить состояние сервиса и настроить автопостинг.', true);
   if (update.update_type !== 'message_created' || update.is_channel || update.message?.sender?.is_bot) return;
   const command = maxAssistantText(update).match(/^\/([a-z_]+)(?:\s|$)/i)?.[1]?.toLowerCase();
   if (!command) return;
-  if (command === 'start' || command === 'cabinet' || command === 'connect') return sendMaxAssistantMessage(update.chat_id, 'Откройте мини-приложение: там находятся подключения, история репостов и баланс.', true);
-  if (command === 'status') return sendMaxAssistantMessage(update.chat_id, 'Статус Multi Post: **сервис работает**. Личные подключения и история доступны только в вашем кабинете.', true);
-  if (command === 'help') return sendMaxAssistantMessage(update.chat_id, '**Команды**\n/start — открыть Multi Post\n/cabinet — кабинет\n/connect — подключения\n/status — статус сервиса\n/help — помощь', true);
-  return sendMaxAssistantMessage(update.chat_id, 'Не понял команду. Напишите /help, чтобы увидеть доступные действия.', true);
+  console.log(`MAX assistant command received: /${command}`);
+  if (command === 'start' || command === 'cabinet' || command === 'connect') return sendMaxAssistantMessage(recipient, 'Откройте мини-приложение: там находятся подключения, история репостов и баланс.', true);
+  if (command === 'status') return sendMaxAssistantMessage(recipient, 'Статус Multi Post: **сервис работает**. Личные подключения и история доступны только в вашем кабинете.', true);
+  if (command === 'help') return sendMaxAssistantMessage(recipient, '**Команды**\n/start — открыть Multi Post\n/cabinet — кабинет\n/connect — подключения\n/status — статус сервиса\n/help — помощь', true);
+  return sendMaxAssistantMessage(recipient, 'Не понял команду. Напишите /help, чтобы увидеть доступные действия.', true);
 }
 async function configureMaxAssistant() {
   if (!maxAppReady()) return;
