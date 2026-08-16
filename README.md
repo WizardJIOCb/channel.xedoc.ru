@@ -15,6 +15,20 @@ Secrets stay in `/etc/channel-reposter.env` with mode `600`; they are never comm
 
 If the target MAX chat ID is left empty, the first `bot_added` event stores it automatically. Add the Telegram bot as an administrator of the source channel and the MAX bot as an administrator of the target channel, then use “Переустановить webhook” in the dashboard.
 
+## MAX mini-app and assistant bot
+
+`GET /max` is the compact Mini Post interface intended to be opened inside MAX. It loads the official MAX Bridge when available and otherwise works as an ordinary responsive web page.
+
+To enable bot commands, add these values only to `/etc/channel-reposter.env` and restart the service:
+
+```text
+MAX_APP_BOT_TOKEN=<fresh MAX token>
+MAX_APP_WEBHOOK_SECRET=<random A-Za-z0-9_- secret>
+MAX_APP_BOT_USERNAME=se13980695_bot
+```
+
+At startup the service registers the command menu and the protected webhook `https://channel.xedoc.ru/webhooks/max/app`. The bot supports `/start`, `/cabinet`, `/connect`, `/status`, and `/help`. Do not put the token into a chat, repository, or browser URL.
+
 ## Development check
 
 ```powershell
