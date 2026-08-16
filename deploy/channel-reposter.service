@@ -1,0 +1,23 @@
+[Unit]
+Description=Channel Xedoc Telegram to MAX reposter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=channel-reposter
+Group=channel-reposter
+WorkingDirectory=/var/www/channel.xedoc.ru
+EnvironmentFile=/etc/channel-reposter.env
+Environment=STATE_PATH=/var/lib/channel-reposter/app.json
+ExecStart=/usr/bin/node /var/www/channel.xedoc.ru/server.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/channel-reposter
+
+[Install]
+WantedBy=multi-user.target
