@@ -6,6 +6,8 @@ The cabinet has separate Connections, History, and Profile screens. A welcome ba
 
 Telegram media groups are buffered for two seconds and published as one MAX message with all image/video attachments. One album creates one history item and one tariff charge. Pending albums are persisted in the state file so a service restart during the buffer window does not lose them. Set `TELEGRAM_ALBUM_SETTLE_MS` only if the default collection window needs adjustment.
 
+History entries whose Telegram source payload was saved can be published to MAX again from the History screen. A replay creates a new MAX post, keeps the original history row with a replay counter, and charges the tariff only after MAX confirms the new publication.
+
 ## Production setup
 
 Open `https://channel.xedoc.ru/` and register the owner account. The first account automatically receives the pre-existing `@losvprode` → MAX connection. Other users create their own connection in the dashboard by supplying their Telegram bot token, source channel, MAX bot token, and (optionally) the MAX target chat ID.

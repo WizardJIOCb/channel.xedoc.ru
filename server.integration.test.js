@@ -26,6 +26,30 @@ function webhook(port, payload) {
   });
 }
 
+function postForm(port, path, values) {
+  const body = new URLSearchParams(values).toString();
+  return new Promise((resolve, reject) => {
+    const req = request({ hostname: '127.0.0.1', port, path, method: 'POST', headers: { cookie: 'session=session-1', 'content-type': 'application/x-www-form-urlencoded', 'content-length': Buffer.byteLength(body) } }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({ status: res.statusCode, location: res.headers.location }));
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+function getPage(port, path) {
+  return new Promise((resolve, reject) => {
+    const req = request({ hostname: '127.0.0.1', port, path, method: 'GET', headers: { cookie: 'session=session-1' } }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 async function waitForState(path, predicate, timeout = 6000) {
   const started = Date.now();
   while (Date.now() - started < timeout) {
@@ -43,7 +67,7 @@ test('two Telegram album updates become one MAX post and one charge', async (t) 
   const now = new Date().toISOString();
   await writeFile(statePath, `${JSON.stringify({
     users: [{ id: 'user-1', email: 'album@example.test', role: 'user', balanceKopecks: 500, walletInitializedAt: now, createdAt: now }],
-    sessions: [],
+    sessions: [{ id: 'session-1', userId: 'user-1', csrf: 'csrf-token', expiresAt: Date.now() + 60000 }],
     connections: [{ id: 'connection-1', userId: 'user-1', name: 'Album test', source: 'source_channel', telegramToken: seal('fake-telegram-token', key), telegramSecret: 'telegram-secret', maxToken: seal('fake-max-token', key), maxSecret: 'max-secret', targetChatId: 'max-channel-1', enabled: true, error: null, createdAt: now, updatedAt: now }],
     history: [],
     ledger: [],
@@ -104,4 +128,20 @@ test('two Telegram album updates become one MAX post and one charge', async (t) 
   assert.equal(state.history[0].mediaCount, 2);
   assert.equal(state.ledger.filter((item) => item.type === 'delivery').length, 1);
   assert.equal(state.users[0].balanceKopecks, 400);
+
+  const historyPage = await getPage(port, '/history');
+  assert.equal(historyPage.status, 200);
+  assert.match(historyPage.body, new RegExp(`/history/${state.history[0].id}/replay`));
+  assert.match(historyPage.body, /Отправить ещё раз/);
+
+  const replay = await postForm(port, `/history/${state.history[0].id}/replay`, { csrf: 'csrf-token' });
+  assert.deepEqual(replay, { status: 303, location: '/history?result=replayed' });
+  const replayedState = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(maxMessages.length, 2);
+  assert.equal(maxMessages[1].attachments.length, 2);
+  assert.equal(replayedState.history.length, 1);
+  assert.equal(replayedState.history[0].replayCount, 1);
+  assert.equal(replayedState.ledger.filter((item) => item.type === 'delivery').length, 2);
+  assert.equal(replayedState.ledger[0].replay, true);
+  assert.equal(replayedState.users[0].balanceKopecks, 300);
 });
