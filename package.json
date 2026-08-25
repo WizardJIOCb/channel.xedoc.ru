@@ -7,7 +7,7 @@
     "start": "node server.js",
     "configure": "node configure-webhooks.js",
     "resolve-max-target": "node resolve-max-target.js",
-    "check": "node --check server.js && node --check configure-webhooks.js && node --check resolve-max-target.js"
+    "check": "node --check server.js && node --check media-groups.js && node --check configure-webhooks.js && node --check resolve-max-target.js && node --test media-groups.test.js server.integration.test.js"
   },
   "engines": {
     "node": ">=22"

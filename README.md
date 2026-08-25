@@ -4,6 +4,8 @@ Web application for managing Telegram → MAX reposting. Each registered user ma
 
 The cabinet has separate Connections, History, and Profile screens. A welcome balance is credited at registration; the configurable tariff is deducted only after MAX confirms a post was published. The owner account (`rodion89@list.ru`) has an admin screen for changing the welcome bonus and tariff, and for manual balance credits. YooKassa payments are enabled after `YOOKASSA_SHOP_ID` and `YOOKASSA_SECRET_KEY` are configured on the server; configure the notification URL as `https://channel.xedoc.ru/webhooks/yookassa` in the YooKassa dashboard.
 
+Telegram media groups are buffered for two seconds and published as one MAX message with all image/video attachments. One album creates one history item and one tariff charge. Pending albums are persisted in the state file so a service restart during the buffer window does not lose them. Set `TELEGRAM_ALBUM_SETTLE_MS` only if the default collection window needs adjustment.
+
 ## Production setup
 
 Open `https://channel.xedoc.ru/` and register the owner account. The first account automatically receives the pre-existing `@losvprode` → MAX connection. Other users create their own connection in the dashboard by supplying their Telegram bot token, source channel, MAX bot token, and (optionally) the MAX target chat ID.
