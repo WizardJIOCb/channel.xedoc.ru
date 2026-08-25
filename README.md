@@ -8,6 +8,8 @@ Telegram media groups are buffered for two seconds and published as one MAX mess
 
 History entries whose Telegram source payload was saved can be published to MAX again from the History screen. A replay creates a new MAX post, keeps the original history row with a replay counter, and charges the tariff only after MAX confirms the new publication.
 
+Links in Telegram post text are sent with MAX link previews enabled. MAX generates the preview automatically from the linked page when it is reachable and provides suitable metadata.
+
 ## Production setup
 
 Open `https://channel.xedoc.ru/` and register the owner account. The first account automatically receives the pre-existing `@losvprode` → MAX connection. Other users create their own connection in the dashboard by supplying their Telegram bot token, source channel, MAX bot token, and (optionally) the MAX target chat ID.

@@ -87,6 +87,7 @@ test('two Telegram album updates become one MAX post and one charge', async (t) 
   process.env.TELEGRAM_ALBUM_SETTLE_MS = '500';
 
   const maxMessages = [];
+  const maxMessageUrls = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input, options = {}) => {
     const url = String(input);
@@ -98,6 +99,7 @@ test('two Telegram album updates become one MAX post and one charge', async (t) 
     if (url.startsWith('https://platform-api2.max.ru/uploads?')) return new Response(JSON.stringify({ url: `https://upload.example.test/${maxMessages.length + 1}` }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (url.startsWith('https://upload.example.test/')) return new Response(JSON.stringify({ token: `uploaded-${url.split('/').at(-1)}` }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (url.startsWith('https://platform-api2.max.ru/messages?')) {
+      maxMessageUrls.push(url);
       maxMessages.push(JSON.parse(options.body));
       return new Response(JSON.stringify({ message: { body: { mid: 'max-message-1' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
@@ -120,6 +122,7 @@ test('two Telegram album updates become one MAX post and one charge', async (t) 
 
   const state = await waitForState(statePath, (value) => value.history?.[0]?.status === 'published' && value.pendingAlbums?.length === 0);
   assert.equal(maxMessages.length, 1);
+  assert.equal(new URL(maxMessageUrls[0]).searchParams.has('disable_link_preview'), false);
   assert.equal(maxMessages[0].text, 'Album caption');
   assert.equal(maxMessages[0].attachments.length, 2);
   assert.deepEqual(maxMessages[0].attachments.map((attachment) => attachment.type), ['image', 'image']);
@@ -138,6 +141,7 @@ test('two Telegram album updates become one MAX post and one charge', async (t) 
   assert.deepEqual(replay, { status: 303, location: '/history?result=replayed' });
   const replayedState = JSON.parse(await readFile(statePath, 'utf8'));
   assert.equal(maxMessages.length, 2);
+  assert.equal(new URL(maxMessageUrls[1]).searchParams.has('disable_link_preview'), false);
   assert.equal(maxMessages[1].attachments.length, 2);
   assert.equal(replayedState.history.length, 1);
   assert.equal(replayedState.history[0].replayCount, 1);
