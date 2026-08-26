@@ -232,3 +232,72 @@ test('loading public Telegram posts is non-publishing and each post can be sent 
   assert.equal(sentState.ledger.filter((item) => item.type === 'delivery').length, 1);
   assert.equal(sentState.users[0].balanceKopecks, 400);
 });
+
+test('a Telegram rich message is preserved and published to MAX', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'channel-reposter-rich-message-'));
+  const statePath = join(directory, 'app.json');
+  const key = Buffer.alloc(32, 11);
+  const now = new Date().toISOString();
+  await writeFile(statePath, `${JSON.stringify({
+    users: [{ id: 'user-1', email: 'rich@example.test', role: 'user', balanceKopecks: 500, walletInitializedAt: now, createdAt: now }],
+    sessions: [{ id: 'session-1', userId: 'user-1', csrf: 'csrf-token', expiresAt: Date.now() + 60000 }],
+    connections: [{ id: 'connection-1', userId: 'user-1', name: 'Rich message test', source: 'source_channel', telegramToken: seal('fake-telegram-token', key), telegramSecret: 'telegram-secret', maxToken: seal('fake-max-token', key), maxSecret: 'max-secret', targetChatId: 'max-channel-1', enabled: true, error: null, createdAt: now, updatedAt: now }],
+    history: [],
+    ledger: [],
+    pendingAlbums: [],
+    settings: { welcomeBonusKopecks: 30000, pricePerMessageKopecks: 100 },
+    migrated: true,
+    connectionWebhooksMigrated: true,
+    telegramAssistantWebhooksV1: true,
+    telegramAssistantWebhooksV2: true,
+    telegramAssistantWebhooksV3: true,
+  }, null, 2)}\n`);
+
+  process.env.APP_ENCRYPTION_KEY = key.toString('base64');
+  process.env.PUBLIC_BASE_URL = 'https://channel.example.test';
+  process.env.STATE_PATH = statePath;
+  process.env.PORT = '0';
+
+  const maxMessages = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, options = {}) => {
+    const url = String(input);
+    if (url.startsWith('https://platform-api2.max.ru/messages?')) {
+      maxMessages.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({ message: { body: { mid: 'max-rich-message-1' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    throw new Error(`Unexpected fetch in rich message test: ${url}`);
+  };
+
+  const { server } = await import(`./server.js?rich-message-test=${Date.now()}`);
+  if (!server.listening) await once(server, 'listening');
+  t.after(async () => {
+    globalThis.fetch = originalFetch;
+    if (server.listening) await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const port = server.address().port;
+  const richMessage = {
+    message_id: 843,
+    date: 1787774985,
+    chat: { username: 'source_channel' },
+    rich_message: {
+      blocks: [
+        { type: 'paragraph', text: ['OpenAI дала агентам ', { type: 'bold', text: 'сложный экзамен' }] },
+        { type: 'list', items: [{ label: '•', blocks: [{ type: 'paragraph', text: 'Первый результат' }] }] },
+        { type: 'buttons', buttons: [{ text: 'Технический отчёт', url: 'https://example.test/report.pdf' }] },
+      ],
+    },
+  };
+  assert.equal(await webhook(port, { update_id: 10, channel_post: richMessage }), 200);
+
+  const state = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(maxMessages.length, 1);
+  assert.equal(maxMessages[0].text, 'OpenAI дала агентам сложный экзамен\n\n• Первый результат\n\nТехнический отчёт: https://example.test/report.pdf');
+  assert.equal(state.history[0].status, 'published');
+  assert.deepEqual(state.history[0].sourceMessage.rich_message, richMessage.rich_message);
+  assert.equal(state.history[0].preview, 'OpenAI дала агентам сложный экзамен • Первый результат Технический отчёт: https://example.test/report.pdf');
+  assert.equal(state.ledger.filter((item) => item.type === 'delivery').length, 1);
+  assert.equal(state.users[0].balanceKopecks, 400);
+});

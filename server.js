@@ -5,6 +5,7 @@ import { createCipheriv, createDecipheriv, randomBytes, scrypt as scryptCallback
 import { promisify } from 'node:util';
 import { mediaGroupKey, mergeMessages, normalizeMessages, primaryMessage } from './media-groups.js';
 import { fetchTelegramPublicPosts, publicPostMessages, safeTelegramMediaUrl } from './telegram-public.js';
+import { richMessageFiles, telegramMessageText } from './telegram-rich.js';
 
 const scrypt = promisify(scryptCallback);
 const ADMIN_EMAIL = 'rodion89@list.ru';
@@ -103,29 +104,30 @@ async function configureMaxAssistant() {
   if (!subscription.success) throw new Error(subscription.message || 'MAX rejected the assistant webhook');
 }
 
-function textOf(message) { const primary = primaryMessage(message); return primary.caption || primary.text || ''; }
+function textOf(message) { return telegramMessageText(primaryMessage(message)); }
 function tagsOf(message) { const primary = primaryMessage(message); return primary.caption_entities || primary.entities || []; }
 function validUrl(value) { try { return ['http:', 'https:', 'tg:', 'mailto:', 'tel:'].includes(new URL(value).protocol) ? value : null; } catch { return null; } }
 function telegramTag(entity, text) { const href = entity.type === 'text_link' ? validUrl(entity.url || '') : entity.type === 'url' ? validUrl(text) : null; if (href) return [`<a href="${esc(href)}">`, '</a>']; const map = { bold: ['<b>', '</b>'], italic: ['<i>', '</i>'], underline: ['<u>', '</u>'], strikethrough: ['<s>', '</s>'], code: ['<code>', '</code>'], pre: ['<pre>', '</pre>'] }; return map[entity.type] || null; }
 function formatTelegram(text, entities) { const valid = entities.filter((item) => Number.isInteger(item.offset) && Number.isInteger(item.length) && item.length > 0 && item.offset >= 0 && item.offset + item.length <= text.length).sort((a, b) => a.offset - b.offset || b.length - a.length); if (!valid.length) return null; const points = [...new Set([0, text.length, ...valid.flatMap((item) => [item.offset, item.offset + item.length])])].sort((a, b) => a - b); let used = false; let output = ''; for (let i = 0; i < points.length - 1; i += 1) { const start = points[i]; const end = points[i + 1]; const active = valid.filter((item) => item.offset <= start && item.offset + item.length >= end).map((item) => telegramTag(item, text.slice(item.offset, item.offset + item.length))).filter(Boolean); let part = esc(text.slice(start, end)); for (let j = active.length - 1; j >= 0; j -= 1) part = `${active[j][0]}${part}${active[j][1]}`; used ||= active.length > 0; output += part; } return used ? output : null; }
 function split(text) { if (!text) return ['']; const result = []; let rest = text; while (rest.length > 4000) { const pos = Math.max(rest.lastIndexOf('\n', 4000), rest.lastIndexOf(' ', 4000), 4000); result.push(rest.slice(0, pos).trimEnd()); rest = rest.slice(pos).trimStart(); } result.push(rest); return result; }
-function fileOf(message) {
+function filesOf(message) {
   if (message.imported_media) {
     const url = safeTelegramMediaUrl(message.imported_media.url);
-    return url ? { ...message.imported_media, url } : null;
+    return url ? [{ ...message.imported_media, url }] : [];
   }
-  if (message.photo?.length) return { type: 'image', id: message.photo.at(-1).file_id, name: 'telegram-photo.jpg', mime: 'image/jpeg' };
-  if (message.video) return { type: 'video', id: message.video.file_id, name: message.video.file_name || 'telegram-video.mp4', mime: message.video.mime_type || 'video/mp4' };
-  if (message.animation) return { type: 'video', id: message.animation.file_id, name: message.animation.file_name || 'telegram-animation.mp4', mime: message.animation.mime_type || 'video/mp4' };
-  if (message.video_note) return { type: 'video', id: message.video_note.file_id, name: 'telegram-video-note.mp4', mime: 'video/mp4' };
-  if (message.sticker && !message.sticker.is_animated && !message.sticker.is_video) return { type: 'image', id: message.sticker.file_id, name: 'telegram-sticker.webp', mime: 'image/webp' };
-  if (message.audio) return { type: 'audio', id: message.audio.file_id, name: message.audio.file_name || 'telegram-audio.mp3', mime: message.audio.mime_type || 'audio/mpeg' };
-  if (message.voice) return { type: 'audio', id: message.voice.file_id, name: 'telegram-voice.ogg', mime: message.voice.mime_type || 'audio/ogg' };
-  if (message.document) return { type: 'file', id: message.document.file_id, name: message.document.file_name || 'telegram-file', mime: message.document.mime_type || 'application/octet-stream' };
-  return null;
+  if (message.photo?.length) return [{ type: 'image', id: message.photo.at(-1).file_id, name: 'telegram-photo.jpg', mime: 'image/jpeg' }];
+  if (message.video) return [{ type: 'video', id: message.video.file_id, name: message.video.file_name || 'telegram-video.mp4', mime: message.video.mime_type || 'video/mp4' }];
+  if (message.animation) return [{ type: 'video', id: message.animation.file_id, name: message.animation.file_name || 'telegram-animation.mp4', mime: message.animation.mime_type || 'video/mp4' }];
+  if (message.video_note) return [{ type: 'video', id: message.video_note.file_id, name: 'telegram-video-note.mp4', mime: 'video/mp4' }];
+  if (message.sticker && !message.sticker.is_animated && !message.sticker.is_video) return [{ type: 'image', id: message.sticker.file_id, name: 'telegram-sticker.webp', mime: 'image/webp' }];
+  if (message.audio) return [{ type: 'audio', id: message.audio.file_id, name: message.audio.file_name || 'telegram-audio.mp3', mime: message.audio.mime_type || 'audio/mpeg' }];
+  if (message.voice) return [{ type: 'audio', id: message.voice.file_id, name: 'telegram-voice.ogg', mime: message.voice.mime_type || 'audio/ogg' }];
+  if (message.document) return [{ type: 'file', id: message.document.file_id, name: message.document.file_name || 'telegram-file', mime: message.document.mime_type || 'application/octet-stream' }];
+  return richMessageFiles(message);
 }
-function snapshotMessage(message) { const fields = ['message_id', 'media_group_id', 'date', 'text', 'caption', 'entities', 'caption_entities', 'photo', 'video', 'animation', 'video_note', 'sticker', 'audio', 'voice', 'document', 'public_import', 'imported_media']; return Object.fromEntries(fields.filter((field) => message[field] !== undefined).map((field) => [field, message[field]])); }
-function unsupportedKind(message) { return ['sticker', 'poll', 'dice', 'location', 'venue', 'contact', 'game', 'invoice', 'story', 'paid_media'].find((kind) => message[kind]) || 'без текста и вложения'; }
+function fileOf(message) { return filesOf(message)[0] || null; }
+function snapshotMessage(message) { const fields = ['message_id', 'media_group_id', 'date', 'text', 'caption', 'entities', 'caption_entities', 'photo', 'video', 'animation', 'video_note', 'sticker', 'audio', 'voice', 'document', 'rich_message', 'reply_markup', 'public_import', 'imported_media']; return Object.fromEntries(fields.filter((field) => message[field] !== undefined).map((field) => [field, message[field]])); }
+function unsupportedKind(message) { return ['rich_message', 'sticker', 'poll', 'dice', 'location', 'venue', 'contact', 'game', 'invoice', 'story', 'paid_media'].find((kind) => message[kind]) || 'без текста и вложения'; }
 async function upload(connection, item) {
   const maxToken = unseal(connection.maxToken);
   let source;
@@ -163,7 +165,7 @@ async function upload(connection, item) {
   return { type: item.type, payload: { token } };
 }
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function publish(connection, message, editMessageId = null) { if (!connection.targetChatId) throw new Error('MAX channel has not been connected'); const messages = normalizeMessages(message); const primary = primaryMessage(messages); const original = textOf(primary); const formatted = formatTelegram(original, tagsOf(primary)); const htmlText = Boolean(formatted && formatted.length <= 4000); const files = messages.map(fileOf).filter(Boolean); if (!original.trim() && !files.length) throw new Error(`Тип публикации Telegram пока не поддержан: ${unsupportedKind(primary)}`); if (files.length > 12) throw new Error('MAX поддерживает не более 12 вложений в одном сообщении'); const attachments = await Promise.all(files.map((file) => upload(connection, file))); const maxToken = unseal(connection.maxToken); let maxMessageId = editMessageId; for (const [index, text] of (htmlText ? [formatted] : split(original)).entries()) { const editing = Boolean(editMessageId && index === 0); const payload = { text, notify: true }; if (htmlText) payload.format = 'html'; if (!index && attachments.length) payload.attachments = attachments; const endpoint = editing ? `https://platform-api2.max.ru/messages?message_id=${encodeURIComponent(editMessageId)}` : `https://platform-api2.max.ru/messages?chat_id=${encodeURIComponent(connection.targetChatId)}`; for (let attempt = 0; attempt < 4; attempt += 1) { const response = await fetch(endpoint, { method: editing ? 'PUT' : 'POST', headers: { Authorization: maxToken, 'content-type': 'application/json' }, body: JSON.stringify(payload) }); if (response.ok) { const body = await response.json().catch(() => ({})); maxMessageId ||= body.message?.body?.mid || body.body?.mid || body.message_id || null; break; } const detail = await response.text(); if ((response.status < 500 && !detail.includes('attachment.not.ready')) || attempt === 3) throw new Error(`MAX rejected the post (${response.status}): ${detail.slice(0, 180)}`); await pause(1500 * (attempt + 1)); } } return maxMessageId; }
+async function publish(connection, message, editMessageId = null) { if (!connection.targetChatId) throw new Error('MAX channel has not been connected'); const messages = normalizeMessages(message); const primary = primaryMessage(messages); const original = textOf(primary); const formatted = formatTelegram(original, tagsOf(primary)); const htmlText = Boolean(formatted && formatted.length <= 4000); const files = messages.flatMap(filesOf); if (!original.trim() && !files.length) throw new Error(`Тип публикации Telegram пока не поддержан: ${unsupportedKind(primary)}`); if (files.length > 12) throw new Error('MAX поддерживает не более 12 вложений в одном сообщении'); const attachments = await Promise.all(files.map((file) => upload(connection, file))); const maxToken = unseal(connection.maxToken); let maxMessageId = editMessageId; for (const [index, text] of (htmlText ? [formatted] : split(original)).entries()) { const editing = Boolean(editMessageId && index === 0); const payload = { text, notify: true }; if (htmlText) payload.format = 'html'; if (!index && attachments.length) payload.attachments = attachments; const endpoint = editing ? `https://platform-api2.max.ru/messages?message_id=${encodeURIComponent(editMessageId)}` : `https://platform-api2.max.ru/messages?chat_id=${encodeURIComponent(connection.targetChatId)}`; for (let attempt = 0; attempt < 4; attempt += 1) { const response = await fetch(endpoint, { method: editing ? 'PUT' : 'POST', headers: { Authorization: maxToken, 'content-type': 'application/json' }, body: JSON.stringify(payload) }); if (response.ok) { const body = await response.json().catch(() => ({})); maxMessageId ||= body.message?.body?.mid || body.body?.mid || body.message_id || null; break; } const detail = await response.text(); if ((response.status < 500 && !detail.includes('attachment.not.ready')) || attempt === 3) throw new Error(`MAX rejected the post (${response.status}): ${detail.slice(0, 180)}`); await pause(1500 * (attempt + 1)); } } return maxMessageId; }
 async function configure(connection) { const maxToken = unseal(connection.maxToken); await telegramApi(connection, 'setWebhook', { url: `${env.baseUrl}/webhooks/telegram/${connection.id}`, secret_token: connection.telegramSecret, allowed_updates: ['channel_post', 'edited_channel_post', 'message'] }); await telegramApi(connection, 'setMyCommands', { commands: telegramAssistantCommands }); const response = await (await fetch('https://platform-api2.max.ru/subscriptions', { method: 'POST', headers: { Authorization: maxToken, 'content-type': 'application/json' }, body: JSON.stringify({ url: `${env.baseUrl}/webhooks/max/${connection.id}`, update_types: ['bot_added', 'bot_removed'], secret: connection.maxSecret }) })).json(); if (!response.success) throw new Error('MAX rejected this bot token'); connection.error = null; connection.updatedAt = stamp(); await save(); }
 async function tryConfigure(connection) { try { await configure(connection); } catch (error) { connection.error = String(error.message || error); connection.updatedAt = stamp(); await save(); } }
 
@@ -184,7 +186,7 @@ async function deliveryItem(connection, message, edited = false) {
   const messages = mediaGroupId && previous.length ? mergeMessages(previous, incoming) : incoming;
   const messageIds = messages.map((entry) => String(entry.message_id || '')).filter(Boolean);
   const snapshots = messages.map(snapshotMessage);
-  const files = messages.map(fileOf).filter(Boolean);
+  const files = messages.flatMap(filesOf);
   const mediaType = files.length > 1 ? `альбом (${files.length})` : files[0]?.type || null;
   if (!item) {
     item = { id: rid(), connectionId: connection.id, telegramMessageId: messageIds[0] || '', source: connection.source, status: 'processing', attempts: 0, error: null, createdAt: stamp(), updatedAt: stamp(), deliveredAt: null };
