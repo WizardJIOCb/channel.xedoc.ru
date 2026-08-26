@@ -12,6 +12,8 @@ For public Telegram channels, the connection card can load up to ten recent text
 
 Links in Telegram post text are sent with MAX link previews enabled. MAX generates the preview automatically from the linked page when it is reachable and provides suitable metadata.
 
+Telegram text entities and rich-message blocks are converted to MAX HTML so supported bold, italic, underline, strikethrough, code, headings, quotations, highlights, and links keep their formatting. Long formatted posts are split into balanced HTML chunks within the MAX message limit.
+
 ## Production setup
 
 Open `https://channel.xedoc.ru/` and register the owner account. The first account automatically receives the pre-existing `@losvprode` → MAX connection. Other users create their own connection in the dashboard by supplying their Telegram bot token, source channel, MAX bot token, and (optionally) the MAX target chat ID.

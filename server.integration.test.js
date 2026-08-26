@@ -294,7 +294,8 @@ test('a Telegram rich message is preserved and published to MAX', async (t) => {
 
   const state = JSON.parse(await readFile(statePath, 'utf8'));
   assert.equal(maxMessages.length, 1);
-  assert.equal(maxMessages[0].text, 'OpenAI дала агентам сложный экзамен\n\n• Первый результат\n\nТехнический отчёт: https://example.test/report.pdf');
+  assert.equal(maxMessages[0].format, 'html');
+  assert.equal(maxMessages[0].text, 'OpenAI дала агентам <b>сложный экзамен</b>\n\n• Первый результат\n\n<a href="https://example.test/report.pdf">Технический отчёт</a>');
   assert.equal(state.history[0].status, 'published');
   assert.deepEqual(state.history[0].sourceMessage.rich_message, richMessage.rich_message);
   assert.equal(state.history[0].preview, 'OpenAI дала агентам сложный экзамен • Первый результат Технический отчёт: https://example.test/report.pdf');
