@@ -8,6 +8,8 @@ Telegram media groups are buffered for two seconds and published as one MAX mess
 
 History entries whose Telegram source payload was saved can be published to MAX again from the History screen. A replay creates a new MAX post, keeps the original history row with a replay counter, and charges the tariff only after MAX confirms the new publication.
 
+For public Telegram channels, the connection card can load up to ten recent text, photo, video, or album posts. Loading only creates a private list in the cabinet; it never publishes or charges the balance. Each candidate has its own confirmed “Отправить в MAX” action, and the public media URL is refreshed immediately before sending.
+
 Links in Telegram post text are sent with MAX link previews enabled. MAX generates the preview automatically from the linked page when it is reachable and provides suitable metadata.
 
 ## Production setup
