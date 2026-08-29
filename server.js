@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { openAsBlob } from 'node:fs';
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { createCipheriv, createDecipheriv, randomBytes, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
@@ -7,10 +8,12 @@ import { mediaGroupKey, mergeMessages, normalizeMessages, primaryMessage } from 
 import { applyMaxTargetUpdate } from './max-target.js';
 import { fetchTelegramPublicPosts, publicPostMessages, safeTelegramMediaUrl } from './telegram-public.js';
 import { richMessageFiles, splitHtml, telegramMessageHtml, telegramMessageText } from './telegram-rich.js';
+import { telegramBotUrl, telegramFileUrl, telegramRouting, trustedLocalTelegramPath } from './telegram-routing.js';
 
 const scrypt = promisify(scryptCallback);
 const ADMIN_EMAIL = 'rodion89@list.ru';
 const ALBUM_SETTLE_MS = Math.max(500, Number(process.env.TELEGRAM_ALBUM_SETTLE_MS) || 2000);
+const telegramRoute = telegramRouting();
 const env = { port: Number(process.env.PORT || 3015), baseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, ''), key: Buffer.from(process.env.APP_ENCRYPTION_KEY || '', 'base64'), file: process.env.STATE_PATH || '/var/lib/channel-reposter/app.json', yookassa: { shopId: process.env.YOOKASSA_SHOP_ID || '', secret: process.env.YOOKASSA_SECRET_KEY || '' }, maxApp: { token: process.env.MAX_APP_BOT_TOKEN || '', secret: process.env.MAX_APP_WEBHOOK_SECRET || '', username: (process.env.MAX_APP_BOT_USERNAME || '').replace(/^@/, '') }, legacy: { tg: process.env.TELEGRAM_BOT_TOKEN || '', tgSecret: process.env.TELEGRAM_WEBHOOK_SECRET || '', source: (process.env.TELEGRAM_SOURCE_CHANNEL_USERNAME || '').replace(/^@/, '').toLowerCase(), max: process.env.MAX_BOT_TOKEN || '', maxSecret: process.env.MAX_WEBHOOK_SECRET || '', target: process.env.MAX_TARGET_CHAT_ID || '' } };
 if (env.key.length !== 32) throw new Error('APP_ENCRYPTION_KEY must be a base64-encoded 32-byte key');
 if (!env.baseUrl.startsWith('https://')) throw new Error('PUBLIC_BASE_URL must use HTTPS');
@@ -72,7 +75,7 @@ async function settlePayment(payment) { if (!payment || payment.credited || !pay
 function maxAppReady() { return Boolean(env.maxApp.token && env.maxApp.secret && env.maxApp.username); }
 function maxAppLink() { return env.maxApp.username ? `https://max.ru/${encodeURIComponent(env.maxApp.username)}?startapp` : `${env.baseUrl}/max`; }
 const telegramAssistantCommands = [{ command: 'start', description: 'Открыть Multi Post' }, { command: 'link', description: 'Привязать кабинет' }, { command: 'cabinet', description: 'Личный кабинет' }, { command: 'balance', description: 'Показать баланс' }, { command: 'posts', description: 'Последние репосты' }, { command: 'connect', description: 'Подключения' }, { command: 'status', description: 'Статус сервиса' }, { command: 'help', description: 'Помощь' }];
-async function telegramApi(connection, method, payload) { const token = unseal(connection.telegramToken); const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) }); const body = await response.json().catch(() => ({})); if (!response.ok || !body.ok) throw new Error(body.description || `Telegram API returned ${response.status}`); return body.result; }
+async function telegramApi(connection, method, payload) { const token = unseal(connection.telegramToken); const response = await fetch(telegramBotUrl(connection, token, method, telegramRoute), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) }); const body = await response.json().catch(() => ({})); if (!response.ok || !body.ok) throw new Error(body.description || `Telegram API returned ${response.status}`); return body.result; }
 function telegramButton(text = 'Открыть кабинет', url = `${env.baseUrl}/dashboard`) { return { inline_keyboard: [[{ text, url }]] }; }
 async function sendTelegramAssistantMessage(connection, chatId, text, button = null) { const payload = { chat_id: chatId, text, disable_web_page_preview: true }; if (button) payload.reply_markup = button === true ? telegramButton() : button; return telegramApi(connection, 'sendMessage', payload); }
 function telegramLinkedUser(connection, chatId) { return store.users.find((user) => String(user.telegramChatId || '') === String(chatId) && user.telegramConnectionId === connection.id); }
@@ -132,27 +135,38 @@ function unsupportedKind(message) { return ['rich_message', 'sticker', 'poll', '
 async function upload(connection, item) {
   const maxToken = unseal(connection.maxToken);
   let source;
+  let dataBlob;
+  let declaredSize = 0;
   if (item.url) {
     const url = safeTelegramMediaUrl(item.url);
     if (!url) throw new Error('Telegram media URL is not trusted');
     source = await fetch(url, { signal: AbortSignal.timeout(60000) });
   } else {
     const telegramToken = unseal(connection.telegramToken);
-    const info = await (await fetch(`https://api.telegram.org/bot${telegramToken}/getFile?file_id=${encodeURIComponent(item.id)}`)).json();
-    if (!info.ok || !info.result?.file_path) throw new Error('Telegram file is unavailable');
-    source = await fetch(`https://api.telegram.org/file/bot${telegramToken}/${info.result.file_path}`);
+    const info = await telegramApi(connection, 'getFile', { file_id: item.id });
+    if (!info?.file_path) throw new Error('Telegram file is unavailable');
+    const localPath = trustedLocalTelegramPath(connection, info.file_path, telegramRoute);
+    if (localPath) {
+      declaredSize = (await stat(localPath)).size;
+      dataBlob = await openAsBlob(localPath, { type: item.mime || 'application/octet-stream' });
+    } else {
+      source = await fetch(telegramFileUrl(connection, telegramToken, info.file_path, telegramRoute), { signal: AbortSignal.timeout(60000) });
+    }
   }
-  if (!source.ok) throw new Error(`Telegram media is unavailable (${source.status})`);
+  if (source && !source.ok) throw new Error(`Telegram media is unavailable (${source.status})`);
   const limit = item.type === 'image' ? 50 * 1024 * 1024 : item.type === 'video' ? 250 * 1024 * 1024 : Infinity;
-  const declaredSize = Number(source.headers.get('content-length') || 0);
+  declaredSize ||= Number(source?.headers.get('content-length') || 0);
   if (declaredSize && declaredSize > limit) throw new Error(`Файл ${item.type === 'video' ? 'видео' : 'изображения'} превышает лимит MAX`);
-  const bytes = await source.arrayBuffer();
-  if (bytes.byteLength > limit) throw new Error(`Файл ${item.type === 'video' ? 'видео' : 'изображения'} превышает лимит MAX`);
+  if (!dataBlob) {
+    const bytes = await source.arrayBuffer();
+    if (bytes.byteLength > limit) throw new Error(`Файл ${item.type === 'video' ? 'видео' : 'изображения'} превышает лимит MAX`);
+    dataBlob = new Blob([bytes], { type: item.mime || source.headers.get('content-type') || 'application/octet-stream' });
+  }
   const endpoint = await fetch(`https://platform-api2.max.ru/uploads?type=${item.type}`, { method: 'POST', headers: { Authorization: maxToken } });
   const address = await endpoint.json();
   if (!endpoint.ok || !address.url) throw new Error('MAX upload URL failed');
   const data = new FormData();
-  data.append('data', new Blob([bytes], { type: item.mime || source.headers.get('content-type') || 'application/octet-stream' }), item.name);
+  data.append('data', dataBlob, item.name);
   const response = await fetch(address.url, { method: 'POST', body: data });
   const body = await response.text();
   if (!response.ok) throw new Error('MAX media upload failed');

@@ -18,6 +18,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/channel-reposter
+ReadOnlyPaths=/var/lib/telegram-bot-api
 
 [Install]
 WantedBy=multi-user.target

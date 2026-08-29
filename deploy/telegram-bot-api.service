@@ -1,0 +1,18 @@
+[Unit]
+Description=Official local Telegram Bot API server
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/docker rm -f telegram-bot-api
+ExecStart=/usr/bin/docker run --name telegram-bot-api --pull=never --network=host --user=997:987 --env-file=/etc/telegram-bot-api.env --volume=/var/lib/telegram-bot-api:/var/lib/telegram-bot-api --memory=900m --memory-swap=900m telegram-bot-api:official-e3e9dd8 --local --http-ip-address=127.0.0.1 --http-port=8081 --dir=/var/lib/telegram-bot-api --temp-dir=/var/lib/telegram-bot-api/temp
+ExecStop=/usr/bin/docker stop --time=30 telegram-bot-api
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=0
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

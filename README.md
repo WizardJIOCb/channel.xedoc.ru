@@ -14,6 +14,8 @@ Links in Telegram post text are sent with MAX link previews enabled. MAX generat
 
 Telegram text entities and rich-message blocks are converted to MAX HTML so supported bold, italic, underline, strikethrough, code, headings, quotations, highlights, and links keep their formatting. Long formatted posts are split into balanced HTML chunks within the MAX message limit.
 
+Large Telegram files can be routed through an official local Bot API server on a per-source basis. Set `TELEGRAM_LOCAL_API_URL`, a comma-separated `TELEGRAM_LOCAL_SOURCES`, and `TELEGRAM_LOCAL_FILE_ROOT`; sources not listed there continue to use the cloud Bot API. In local mode, absolute file paths are accepted only under the configured root and are streamed to MAX from disk.
+
 ## Production setup
 
 Open `https://channel.xedoc.ru/` and register the owner account. The first account automatically receives the pre-existing `@losvprode` → MAX connection. Other users create their own connection in the dashboard by supplying their Telegram bot token, source channel, MAX bot token, and (optionally) the MAX target chat ID.

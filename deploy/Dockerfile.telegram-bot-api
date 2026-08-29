@@ -1,0 +1,31 @@
+FROM ubuntu:24.04 AS builder
+
+ARG TELEGRAM_BOT_API_COMMIT=e3e9dd8e5b3d7ab8537cd5a10dc31d5ffa8f82d1
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates clang-18 cmake git gperf libc++-18-dev libc++abi-18-dev libssl-dev make zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --filter=blob:none https://github.com/tdlib/telegram-bot-api.git /src \
+    && cd /src \
+    && git checkout "${TELEGRAM_BOT_API_COMMIT}" \
+    && git submodule update --init --recursive --depth 1
+
+RUN cmake -S /src -B /src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=/usr/bin/clang-18 \
+      -DCMAKE_CXX_COMPILER=/usr/bin/clang++-18 \
+      -DCMAKE_INSTALL_PREFIX=/src \
+    && cmake --build /src/build --target install --parallel 2
+
+FROM ubuntu:24.04
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates libc++1-18 libc++abi1-18 libssl3t64 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
+
+ENTRYPOINT ["/usr/local/bin/telegram-bot-api"]

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createCipheriv } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -91,8 +91,8 @@ test('two Telegram album updates become one MAX post and one charge', async (t) 
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input, options = {}) => {
     const url = String(input);
-    if (url.includes('/getFile?')) {
-      const fileId = new URL(url).searchParams.get('file_id');
+    if (url.endsWith('/getFile')) {
+      const fileId = JSON.parse(options.body).file_id;
       return new Response(JSON.stringify({ ok: true, result: { file_path: `photos/${fileId}.jpg` } }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.includes('/file/bot')) return new Response(Buffer.from('fake image bytes'), { status: 200, headers: { 'content-type': 'image/jpeg' } });
@@ -301,4 +301,68 @@ test('a Telegram rich message is preserved and published to MAX', async (t) => {
   assert.equal(state.history[0].preview, 'OpenAI дала агентам сложный экзамен • Первый результат Технический отчёт: https://example.test/report.pdf');
   assert.equal(state.ledger.filter((item) => item.type === 'delivery').length, 1);
   assert.equal(state.users[0].balanceKopecks, 400);
+});
+
+test('a configured local Telegram source uploads a file-backed Blob without a Telegram file download request', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'channel-reposter-local-telegram-'));
+  const telegramRoot = join(directory, 'telegram-bot-api');
+  const videoPath = join(telegramRoot, 'bot-data', 'videos', 'large.mp4');
+  const statePath = join(directory, 'app.json');
+  const key = Buffer.alloc(32, 13);
+  const now = new Date().toISOString();
+  await mkdir(join(telegramRoot, 'bot-data', 'videos'), { recursive: true });
+  await writeFile(videoPath, Buffer.from('file-backed-video'));
+  await writeFile(statePath, `${JSON.stringify({
+    users: [{ id: 'user-1', email: 'local@example.test', role: 'user', balanceKopecks: 500, walletInitializedAt: now, createdAt: now }],
+    sessions: [{ id: 'session-1', userId: 'user-1', csrf: 'csrf-token', expiresAt: Date.now() + 60000 }],
+    connections: [{ id: 'connection-1', userId: 'user-1', name: 'Local Telegram test', source: 'anytin_sadik', telegramToken: seal('fake-telegram-token', key), telegramSecret: 'telegram-secret', maxToken: seal('fake-max-token', key), maxSecret: 'max-secret', targetChatId: 'max-channel-1', enabled: true, error: null, createdAt: now, updatedAt: now }],
+    history: [], ledger: [], pendingAlbums: [], settings: { welcomeBonusKopecks: 30000, pricePerMessageKopecks: 100 }, migrated: true,
+    connectionWebhooksMigrated: true, telegramAssistantWebhooksV1: true, telegramAssistantWebhooksV2: true, telegramAssistantWebhooksV3: true,
+  }, null, 2)}\n`);
+
+  process.env.APP_ENCRYPTION_KEY = key.toString('base64');
+  process.env.PUBLIC_BASE_URL = 'https://channel.example.test';
+  process.env.STATE_PATH = statePath;
+  process.env.PORT = '0';
+  process.env.TELEGRAM_LOCAL_API_URL = 'http://127.0.0.1:8081';
+  process.env.TELEGRAM_LOCAL_SOURCES = 'anytin_sadik';
+  process.env.TELEGRAM_LOCAL_FILE_ROOT = telegramRoot;
+
+  const fetches = [];
+  let uploadedSize = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, options = {}) => {
+    const url = String(input);
+    fetches.push(url);
+    if (url === 'http://127.0.0.1:8081/botfake-telegram-token/getFile') {
+      return new Response(JSON.stringify({ ok: true, result: { file_path: videoPath } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url === 'https://platform-api2.max.ru/uploads?type=video') return new Response(JSON.stringify({ url: 'https://upload.example.test/local-video' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url === 'https://upload.example.test/local-video') {
+      uploadedSize = options.body.get('data').size;
+      return new Response(JSON.stringify({ token: 'uploaded-local-video' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.startsWith('https://platform-api2.max.ru/messages?')) return new Response(JSON.stringify({ message: { body: { mid: 'max-local-video-1' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    throw new Error(`Unexpected fetch in local Telegram test: ${url}`);
+  };
+
+  const { server } = await import(`./server.js?local-telegram-test=${Date.now()}`);
+  if (!server.listening) await once(server, 'listening');
+  t.after(async () => {
+    globalThis.fetch = originalFetch;
+    delete process.env.TELEGRAM_LOCAL_API_URL;
+    delete process.env.TELEGRAM_LOCAL_SOURCES;
+    delete process.env.TELEGRAM_LOCAL_FILE_ROOT;
+    if (server.listening) await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const port = server.address().port;
+  assert.equal(await webhook(port, { update_id: 20, channel_post: { message_id: 900, date: 1787932800, chat: { username: 'anytin_sadik' }, caption: 'Большое видео', video: { file_id: 'large-video-id', file_name: 'large.mp4', mime_type: 'video/mp4' } } }), 200);
+
+  const state = await waitForState(statePath, (value) => value.history?.[0]?.status === 'published');
+  assert.equal(uploadedSize, Buffer.byteLength('file-backed-video'));
+  assert.equal(fetches.some((url) => url.includes('/file/bot')), false);
+  assert.equal(state.history[0].mediaType, 'video');
+  assert.equal(state.ledger.filter((item) => item.type === 'delivery').length, 1);
 });
