@@ -19,6 +19,17 @@ test('routes only configured Telegram sources through the local Bot API', () => 
   assert.equal(telegramFileUrl(cloud, 'token', 'videos/file.mp4', routing), 'https://api.telegram.org/file/bottoken/videos/file.mp4');
 });
 
+test('routes every source locally when the wildcard is configured', () => {
+  const routing = telegramRouting({
+    TELEGRAM_LOCAL_API_URL: 'http://127.0.0.1:8081',
+    TELEGRAM_LOCAL_SOURCES: '*',
+  });
+
+  assert.equal(usesLocalTelegram({ source: 'anytin_sadik' }, routing), true);
+  assert.equal(usesLocalTelegram({ source: 'losvprode' }, routing), true);
+  assert.equal(usesLocalTelegram({ source: 'future_channel' }, routing), true);
+});
+
 test('accepts local Bot API files only inside its configured data directory', () => {
   const routing = telegramRouting({
     TELEGRAM_LOCAL_API_URL: 'http://127.0.0.1:8081',

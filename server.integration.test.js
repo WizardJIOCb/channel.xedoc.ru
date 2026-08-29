@@ -366,3 +366,77 @@ test('a configured local Telegram source uploads a file-backed Blob without a Te
   assert.equal(state.history[0].mediaType, 'video');
   assert.equal(state.ledger.filter((item) => item.type === 'delivery').length, 1);
 });
+
+test('a new connection logs the bot out of the cloud before configuring its local webhook', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'channel-reposter-new-local-'));
+  const statePath = join(directory, 'app.json');
+  const key = Buffer.alloc(32, 17);
+  const now = new Date().toISOString();
+  await writeFile(statePath, `${JSON.stringify({
+    users: [{ id: 'user-1', email: 'new-local@example.test', role: 'user', balanceKopecks: 500, walletInitializedAt: now, createdAt: now }],
+    sessions: [{ id: 'session-1', userId: 'user-1', csrf: 'csrf-token', expiresAt: Date.now() + 60000 }],
+    connections: [], history: [], ledger: [], pendingAlbums: [], settings: { welcomeBonusKopecks: 30000, pricePerMessageKopecks: 100 }, migrated: true,
+    connectionWebhooksMigrated: true, telegramAssistantWebhooksV1: true, telegramAssistantWebhooksV2: true, telegramAssistantWebhooksV3: true,
+  }, null, 2)}\n`);
+
+  process.env.APP_ENCRYPTION_KEY = key.toString('base64');
+  process.env.PUBLIC_BASE_URL = 'https://channel.example.test';
+  process.env.STATE_PATH = statePath;
+  process.env.PORT = '0';
+  process.env.TELEGRAM_LOCAL_API_URL = 'http://127.0.0.1:8081';
+  process.env.TELEGRAM_LOCAL_SOURCES = '*';
+  process.env.TELEGRAM_LOCAL_FILE_ROOT = join(directory, 'telegram-bot-api');
+
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, options = {}) => {
+    const url = String(input);
+    if (url === 'https://api.telegram.org/botnew-telegram-token/logOut') {
+      calls.push('cloud-logOut');
+      return new Response(JSON.stringify({ ok: true, result: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url === 'http://127.0.0.1:8081/botnew-telegram-token/setWebhook') {
+      calls.push('local-setWebhook');
+      return new Response(JSON.stringify({ ok: true, result: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url === 'http://127.0.0.1:8081/botnew-telegram-token/setMyCommands') {
+      calls.push('local-setMyCommands');
+      return new Response(JSON.stringify({ ok: true, result: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url === 'https://platform-api2.max.ru/subscriptions') {
+      calls.push('max-subscription');
+      return new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    throw new Error(`Unexpected fetch in new local connection test: ${url}`);
+  };
+
+  const { server } = await import(`./server.js?new-local-connection-test=${Date.now()}`);
+  if (!server.listening) await once(server, 'listening');
+  t.after(async () => {
+    globalThis.fetch = originalFetch;
+    delete process.env.TELEGRAM_LOCAL_API_URL;
+    delete process.env.TELEGRAM_LOCAL_SOURCES;
+    delete process.env.TELEGRAM_LOCAL_FILE_ROOT;
+    if (server.listening) await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const port = server.address().port;
+  const created = await postForm(port, '/connections', {
+    csrf: 'csrf-token',
+    name: 'Future local channel',
+    source: '@future_channel',
+    telegramToken: 'new-telegram-token',
+    maxToken: 'new-max-token',
+    targetChatId: 'max-future-channel',
+  });
+  assert.deepEqual(created, { status: 303, location: '/dashboard' });
+  assert.deepEqual(calls, ['cloud-logOut', 'local-setWebhook', 'local-setMyCommands', 'max-subscription']);
+
+  const state = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(state.connections.length, 1);
+  assert.equal(state.connections[0].source, 'future_channel');
+  assert.equal(state.connections[0].telegramApiMode, 'local');
+  assert.ok(state.connections[0].telegramApiMigratedAt);
+  assert.equal(state.connections[0].error, null);
+});

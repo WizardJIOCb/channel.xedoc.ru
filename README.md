@@ -14,7 +14,7 @@ Links in Telegram post text are sent with MAX link previews enabled. MAX generat
 
 Telegram text entities and rich-message blocks are converted to MAX HTML so supported bold, italic, underline, strikethrough, code, headings, quotations, highlights, and links keep their formatting. Long formatted posts are split into balanced HTML chunks within the MAX message limit.
 
-Large Telegram files can be routed through an official local Bot API server on a per-source basis. Set `TELEGRAM_LOCAL_API_URL`, a comma-separated `TELEGRAM_LOCAL_SOURCES`, and `TELEGRAM_LOCAL_FILE_ROOT`; sources not listed there continue to use the cloud Bot API. In local mode, absolute file paths are accepted only under the configured root and are streamed to MAX from disk.
+Large Telegram files are routed through an official local Bot API server. Set `TELEGRAM_LOCAL_API_URL`, `TELEGRAM_LOCAL_SOURCES=*`, and `TELEGRAM_LOCAL_FILE_ROOT` to make it the default for all existing and future connections; a comma-separated source allowlist is still supported when a partial rollout is needed. When a new local connection is created, the service first calls the cloud Bot API `logOut` method once and then installs the webhook through the local server. Absolute file paths are accepted only under the configured root and are streamed to MAX from disk.
 
 ## Production setup
 

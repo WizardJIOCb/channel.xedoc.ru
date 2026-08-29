@@ -14,7 +14,7 @@ export function telegramRouting(environment = process.env) {
 
 export function usesLocalTelegram(connection, routing) {
   const source = String(connection?.source || '').replace(/^@/, '').toLowerCase();
-  return Boolean(routing.baseUrl && routing.sources.has(source));
+  return Boolean(routing.baseUrl && (routing.sources.has('*') || routing.sources.has(source)));
 }
 
 export function telegramBotUrl(connection, token, method, routing) {
