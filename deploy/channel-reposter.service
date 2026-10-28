@@ -13,6 +13,7 @@ Environment=STATE_PATH=/var/lib/channel-reposter/app.json
 Environment=TELEGRAM_LOCAL_API_URL=http://127.0.0.1:8081
 Environment=TELEGRAM_LOCAL_SOURCES=*
 Environment=TELEGRAM_LOCAL_FILE_ROOT=/var/lib/telegram-bot-api
+Environment=MEDIA_CONVERSION_DIR=/var/lib/channel-reposter/transcode
 ExecStart=/usr/bin/node /var/www/channel.xedoc.ru/server.js
 Restart=on-failure
 RestartSec=5

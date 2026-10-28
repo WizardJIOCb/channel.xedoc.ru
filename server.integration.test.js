@@ -60,6 +60,16 @@ async function waitForState(path, predicate, timeout = 6000) {
   throw new Error('Timed out waiting for the album delivery state');
 }
 
+function silenceWav(samples = 800) {
+  const dataLength = samples * 2;
+  const wav = Buffer.alloc(44 + dataLength);
+  wav.write('RIFF'); wav.writeUInt32LE(36 + dataLength, 4); wav.write('WAVE', 8);
+  wav.write('fmt ', 12); wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(8000, 24); wav.writeUInt32LE(16000, 28); wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34);
+  wav.write('data', 36); wav.writeUInt32LE(dataLength, 40);
+  return wav;
+}
+
 test('two Telegram album updates become one MAX post and one charge', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'channel-reposter-album-'));
   const statePath = join(directory, 'app.json');
@@ -214,6 +224,10 @@ test('loading public Telegram posts is non-publishing and each post can be sent 
 
   const dashboard = await getPage(port, '/dashboard');
   assert.equal(dashboard.status, 200);
+  assert.match(dashboard.body, /Ваши каналы под контролем/);
+  assert.match(dashboard.body, /Календарь публикаций/);
+  assert.match(dashboard.body, /WhatsApp · доставлено/);
+  assert.doesNotMatch(dashboard.body, /fake-telegram-token|fake-max-token/);
   assert.match(dashboard.body, /Подгрузить посты с канала/);
   assert.match(dashboard.body, /Праздник в садике/);
   assert.match(dashboard.body, /Загрузка ничего не публикует/);
@@ -259,12 +273,16 @@ test('a Telegram rich message is preserved and published to MAX', async (t) => {
   process.env.PORT = '0';
 
   const maxMessages = [];
+  const maxRequestTimes = [];
+  const maxRequests = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input, options = {}) => {
     const url = String(input);
     if (url.startsWith('https://platform-api2.max.ru/messages?')) {
-      maxMessages.push(JSON.parse(options.body));
-      return new Response(JSON.stringify({ message: { body: { mid: 'max-rich-message-1' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
+      maxRequestTimes.push(Date.now());
+      maxMessages.push(options.body ? JSON.parse(options.body) : null);
+      maxRequests.push({ method: options.method, id: new URL(url).searchParams.get('message_id') });
+      return new Response(JSON.stringify({ message: { body: { mid: new URL(url).searchParams.get('message_id') || `max-rich-message-${maxMessages.length}` } } }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     throw new Error(`Unexpected fetch in rich message test: ${url}`);
   };
@@ -301,6 +319,113 @@ test('a Telegram rich message is preserved and published to MAX', async (t) => {
   assert.equal(state.history[0].preview, 'OpenAI дала агентам сложный экзамен • Первый результат Технический отчёт: https://example.test/report.pdf');
   assert.equal(state.ledger.filter((item) => item.type === 'delivery').length, 1);
   assert.equal(state.users[0].balanceKopecks, 400);
+
+  // Concurrent incoming posts must not interleave the parts of a long post.
+  const longText = 'Long publication first. '.repeat(300);
+  const longPost = { message_id: 844, chat: { username: 'source_channel' }, rich_message: { blocks: [{ type: 'paragraph', text: longText }] } };
+  const nextPost = { message_id: 845, chat: { username: 'source_channel' }, text: 'The following publication' };
+  assert.deepEqual(await Promise.all([
+    webhook(port, { update_id: 11, channel_post: longPost }),
+    webhook(port, { update_id: 12, channel_post: nextPost }),
+  ]), [200, 200]);
+  assert.equal(maxMessages.length, 4);
+  assert.equal(maxMessages.slice(1, 3).map((part) => part.text).join(''), longText);
+  assert.equal(maxMessages[3].text, nextPost.text);
+  for (let index = 1; index < maxRequestTimes.length; index += 1) {
+    assert.ok(maxRequestTimes[index] - maxRequestTimes[index - 1] >= 1100, 'MAX requests need a visible gap');
+  }
+  const orderedState = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(orderedState.history.filter((item) => item.status === 'published').length, 3);
+  assert.equal(orderedState.ledger.filter((item) => item.type === 'delivery').length, 3);
+  assert.deepEqual(orderedState.history.find((item) => item.telegramMessageId === '844').maxMessageIds, ['max-rich-message-2', 'max-rich-message-3']);
+
+  // Editing an old multipart post after another post must update both parts.
+  const editedPost = { ...longPost, rich_message: { blocks: [{ type: 'paragraph', text: longText.replaceAll('first', 'other') }] } };
+  assert.deepEqual(await Promise.all([
+    webhook(port, { update_id: 13, edited_channel_post: editedPost }),
+    webhook(port, { update_id: 14, edited_channel_post: editedPost }),
+  ]), [200, 200]);
+  assert.deepEqual(maxRequests.slice(4), [
+    { method: 'PUT', id: 'max-rich-message-2' }, { method: 'PUT', id: 'max-rich-message-3' },
+    { method: 'PUT', id: 'max-rich-message-2' }, { method: 'PUT', id: 'max-rich-message-3' },
+  ]);
+  const shortened = { ...longPost, rich_message: { blocks: [{ type: 'paragraph', text: 'Shortened publication' }] } };
+  assert.equal(await webhook(port, { update_id: 15, edited_channel_post: shortened }), 200);
+  assert.deepEqual(maxRequests.slice(8), [{ method: 'PUT', id: 'max-rich-message-2' }, { method: 'DELETE', id: 'max-rich-message-3' }]);
+  const editedState = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.deepEqual(editedState.history.find((item) => item.telegramMessageId === '844').maxMessageIds, ['max-rich-message-2']);
+  assert.equal(editedState.ledger.filter((item) => item.type === 'delivery').length, 3);
+  assert.equal(editedState.users[0].balanceKopecks, 200);
+
+  const simultaneous = { message_id: 846, chat: { username: 'source_channel' }, text: 'Only one publication' };
+  assert.deepEqual(await Promise.all([
+    webhook(port, { update_id: 16, channel_post: simultaneous }),
+    webhook(port, { update_id: 17, channel_post: simultaneous }),
+  ]), [200, 200]);
+  assert.equal(maxRequests.filter((call) => call.method === 'POST').length, 5);
+  const deduplicatedState = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(deduplicatedState.history.filter((item) => item.telegramMessageId === '846').length, 1);
+  assert.equal(deduplicatedState.ledger.filter((item) => item.type === 'delivery').length, 4);
+
+});
+
+test('legacy multipart edits recover existing IDs and failed edits never charge again', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'channel-reposter-legacy-'));
+  const statePath = join(directory, 'app.json');
+  const key = Buffer.alloc(32, 12);
+  const now = new Date().toISOString();
+  const source = { message_id: 901, chat: { username: 'source_channel' }, text: 'x'.repeat(6500) };
+  await writeFile(statePath, JSON.stringify({
+    users: [{ id: 'user-1', email: 'legacy@example.test', balanceKopecks: 500, walletInitializedAt: now }],
+    connections: [{ id: 'connection-1', userId: 'user-1', source: 'source_channel', telegramToken: seal('fake-telegram-token', key), telegramSecret: 'telegram-secret', maxToken: seal('fake-max-token', key), targetChatId: 'max-channel-1', enabled: true }],
+    history: [{ id: 'legacy', connectionId: 'connection-1', telegramMessageId: '901', status: 'published', maxMessageId: 'legacy-head', costKopecks: 100, sourceMessage: source, createdAt: now }],
+    ledger: [], settings: { pricePerMessageKopecks: 100 }, migrated: true, connectionWebhooksMigrated: true,
+    telegramAssistantWebhooksV1: true, telegramAssistantWebhooksV2: true, telegramAssistantWebhooksV3: true,
+  }));
+  process.env.APP_ENCRYPTION_KEY = key.toString('base64');
+  process.env.PUBLIC_BASE_URL = 'https://channel.example.test';
+  process.env.STATE_PATH = statePath;
+  process.env.PORT = '0';
+  const calls = [];
+  let failTail = true;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, options = {}) => {
+    const url = new URL(String(input));
+    calls.push({ method: options.method || 'GET', path: url.pathname, id: url.searchParams.get('message_id') });
+    if (url.pathname === '/messages/legacy-head') return Response.json({ timestamp: 1000, body: { mid: 'legacy-head' } });
+    if (!options.method) return Response.json({ messages: [
+      { timestamp: 1001, body: { mid: 'legacy-tail', text: 'x'.repeat(2500) } },
+      { timestamp: 1000, body: { mid: 'legacy-head', text: 'x'.repeat(4000) } },
+    ] });
+    if (url.searchParams.get('message_id') === 'legacy-tail' && failTail) {
+      failTail = false;
+      return Response.json({ message: 'rejected edit' }, { status: 400 });
+    }
+    return Response.json({ success: true });
+  };
+  const { server } = await import(`./server.js?legacy-test=${Date.now()}`);
+  if (!server.listening) await once(server, 'listening');
+  t.after(async () => {
+    globalThis.fetch = originalFetch;
+    await new Promise((resolve) => server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  });
+  const port = server.address().port;
+  const edited = { ...source, text: 'y'.repeat(6500) };
+  assert.equal(await webhook(port, { edited_channel_post: edited }), 200);
+  const failed = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(failed.history[0].status, 'failed');
+  assert.deepEqual(failed.history[0].maxMessageIds, ['legacy-head', 'legacy-tail']);
+  assert.equal(failed.users[0].balanceKopecks, 500);
+  assert.equal(await webhook(port, { edited_channel_post: edited }), 200);
+  const completed = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(completed.history[0].status, 'published');
+  assert.deepEqual(completed.history[0].maxMessageIds, ['legacy-head', 'legacy-tail']);
+  assert.equal(completed.users[0].balanceKopecks, 500);
+  assert.equal(completed.ledger.length, 0);
+  assert.deepEqual(calls.filter((call) => call.method !== 'GET').map((call) => [call.method, call.id]), [
+    ['PUT', 'legacy-head'], ['PUT', 'legacy-tail'], ['PUT', 'legacy-head'], ['PUT', 'legacy-tail'],
+  ]);
 });
 
 test('a configured local Telegram source uploads a file-backed Blob without a Telegram file download request', async (t) => {
@@ -365,6 +490,72 @@ test('a configured local Telegram source uploads a file-backed Blob without a Te
   assert.equal(fetches.some((url) => url.includes('/file/bot')), false);
   assert.equal(state.history[0].mediaType, 'video');
   assert.equal(state.ledger.filter((item) => item.type === 'delivery').length, 1);
+});
+
+test('a local WAV post is converted to MP3 before MAX audio upload', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'channel-reposter-wav-'));
+  const telegramRoot = join(directory, 'telegram-bot-api');
+  const audioPath = join(telegramRoot, 'bot-data', 'audio', 'source.bin');
+  const statePath = join(directory, 'app.json');
+  const key = Buffer.alloc(32, 14);
+  const now = new Date().toISOString();
+  await mkdir(join(telegramRoot, 'bot-data', 'audio'), { recursive: true });
+  await writeFile(audioPath, silenceWav());
+  await writeFile(statePath, `${JSON.stringify({
+    users: [{ id: 'user-1', email: 'wav@example.test', role: 'user', balanceKopecks: 500, walletInitializedAt: now, createdAt: now }],
+    sessions: [{ id: 'session-1', userId: 'user-1', csrf: 'csrf-token', expiresAt: Date.now() + 60000 }],
+    connections: [{ id: 'connection-1', userId: 'user-1', name: 'WAV test', source: 'anytin_sadik', telegramToken: seal('fake-telegram-token', key), telegramSecret: 'telegram-secret', maxToken: seal('fake-max-token', key), maxSecret: 'max-secret', targetChatId: 'max-channel-1', enabled: true, error: null, createdAt: now, updatedAt: now }],
+    history: [], ledger: [], pendingAlbums: [], settings: { welcomeBonusKopecks: 30000, pricePerMessageKopecks: 100 }, migrated: true,
+    connectionWebhooksMigrated: true, telegramAssistantWebhooksV1: true, telegramAssistantWebhooksV2: true, telegramAssistantWebhooksV3: true,
+  }, null, 2)}\n`);
+
+  process.env.APP_ENCRYPTION_KEY = key.toString('base64');
+  process.env.PUBLIC_BASE_URL = 'https://channel.example.test';
+  process.env.STATE_PATH = statePath;
+  process.env.PORT = '0';
+  process.env.TELEGRAM_LOCAL_API_URL = 'http://127.0.0.1:8081';
+  process.env.TELEGRAM_LOCAL_SOURCES = 'anytin_sadik';
+  process.env.TELEGRAM_LOCAL_FILE_ROOT = telegramRoot;
+  process.env.MEDIA_CONVERSION_DIR = join(directory, 'transcode');
+
+  let uploadedAudio;
+  let maxMessage;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, options = {}) => {
+    const url = String(input);
+    if (url === 'http://127.0.0.1:8081/botfake-telegram-token/getFile') return new Response(JSON.stringify({ ok: true, result: { file_path: audioPath } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url === 'https://platform-api2.max.ru/uploads?type=audio') return new Response(JSON.stringify({ url: 'https://upload.example.test/wav', token: 'audio-upload-token' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url === 'https://upload.example.test/wav') {
+      const file = options.body.get('data');
+      uploadedAudio = { name: file.name, type: file.type, size: file.size };
+      return new Response('<retval>1</retval>', { status: 200, headers: { 'content-type': 'application/xml' } });
+    }
+    if (url.startsWith('https://platform-api2.max.ru/messages?')) {
+      maxMessage = JSON.parse(options.body);
+      return new Response(JSON.stringify({ message: { body: { mid: 'max-wav-message-1' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    throw new Error(`Unexpected fetch in WAV test: ${url}`);
+  };
+
+  const { server } = await import(`./server.js?wav-test=${Date.now()}`);
+  if (!server.listening) await once(server, 'listening');
+  t.after(async () => {
+    globalThis.fetch = originalFetch;
+    delete process.env.TELEGRAM_LOCAL_API_URL;
+    delete process.env.TELEGRAM_LOCAL_SOURCES;
+    delete process.env.TELEGRAM_LOCAL_FILE_ROOT;
+    delete process.env.MEDIA_CONVERSION_DIR;
+    if (server.listening) await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const port = server.address().port;
+  assert.equal(await webhook(port, { update_id: 21, channel_post: { message_id: 901, date: 1787932800, chat: { username: 'anytin_sadik' }, caption: 'WAV audio', audio: { file_id: 'wav-audio-id', file_name: 'Rollin.wav', mime_type: 'audio/wav' } } }), 200);
+  const state = await waitForState(statePath, (value) => value.history?.[0]?.status === 'published');
+  assert.deepEqual(uploadedAudio && { name: uploadedAudio.name, type: uploadedAudio.type }, { name: 'Rollin.mp3', type: 'audio/mpeg' });
+  assert.ok(uploadedAudio.size > 0);
+  assert.deepEqual(maxMessage.attachments, [{ type: 'audio', payload: { token: 'audio-upload-token' } }]);
+  assert.equal(state.history[0].mediaType, 'audio');
 });
 
 test('a new connection logs the bot out of the cloud before configuring its local webhook', async (t) => {

@@ -1,7 +1,8 @@
 import { createServer } from 'node:http';
 import { openAsBlob } from 'node:fs';
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { execFile as execFileCallback } from 'node:child_process';
+import { dirname, join } from 'node:path';
 import { createCipheriv, createDecipheriv, randomBytes, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { mediaGroupKey, mergeMessages, normalizeMessages, primaryMessage } from './media-groups.js';
@@ -9,10 +10,17 @@ import { applyMaxTargetUpdate } from './max-target.js';
 import { fetchTelegramPublicPosts, publicPostMessages, safeTelegramMediaUrl } from './telegram-public.js';
 import { richMessageFiles, splitHtml, telegramMessageHtml, telegramMessageText } from './telegram-rich.js';
 import { telegramBotUrl, telegramFileUrl, telegramRouting, trustedLocalTelegramPath, usesLocalTelegram } from './telegram-routing.js';
+import { createWhatsAppFeature } from './whatsapp-feature.js';
+import { createMaxDeliveryQueue } from './max-delivery.js';
+import { plainMaxText, publishMaxParts, recoverMaxPartIds } from './max-publication.js';
+import { createWhatsAppMediaLoader } from './whatsapp-media.js';
+import { dashboardData, renderDashboard } from './dashboard.js';
 
 const scrypt = promisify(scryptCallback);
+const execFile = promisify(execFileCallback);
 const ADMIN_EMAIL = 'rodion89@list.ru';
 const ALBUM_SETTLE_MS = Math.max(500, Number(process.env.TELEGRAM_ALBUM_SETTLE_MS) || 2000);
+const MEDIA_CONVERSION_DIR = process.env.MEDIA_CONVERSION_DIR || '/tmp/channel-reposter-media';
 const telegramRoute = telegramRouting();
 const env = { port: Number(process.env.PORT || 3015), baseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, ''), key: Buffer.from(process.env.APP_ENCRYPTION_KEY || '', 'base64'), file: process.env.STATE_PATH || '/var/lib/channel-reposter/app.json', yookassa: { shopId: process.env.YOOKASSA_SHOP_ID || '', secret: process.env.YOOKASSA_SECRET_KEY || '' }, maxApp: { token: process.env.MAX_APP_BOT_TOKEN || '', secret: process.env.MAX_APP_WEBHOOK_SECRET || '', username: (process.env.MAX_APP_BOT_USERNAME || '').replace(/^@/, '') }, legacy: { tg: process.env.TELEGRAM_BOT_TOKEN || '', tgSecret: process.env.TELEGRAM_WEBHOOK_SECRET || '', source: (process.env.TELEGRAM_SOURCE_CHANNEL_USERNAME || '').replace(/^@/, '').toLowerCase(), max: process.env.MAX_BOT_TOKEN || '', maxSecret: process.env.MAX_WEBHOOK_SECRET || '', target: process.env.MAX_TARGET_CHAT_ID || '' } };
 if (env.key.length !== 32) throw new Error('APP_ENCRYPTION_KEY must be a base64-encoded 32-byte key');
@@ -24,6 +32,8 @@ const albumTimers = new Map();
 const albumFlushes = new Map();
 const historyReplays = new Set();
 const telegramImportSends = new Set();
+const maxDeliveries = createMaxDeliveryQueue();
+const telegramReposts = createMaxDeliveryQueue();
 const rid = (bytes = 24) => randomBytes(bytes).toString('base64url');
 const stamp = () => new Date().toISOString();
 const esc = (value = '') => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
@@ -142,6 +152,27 @@ function filesOf(message) {
 function fileOf(message) { return filesOf(message)[0] || null; }
 function snapshotMessage(message) { const fields = ['message_id', 'media_group_id', 'date', 'text', 'caption', 'entities', 'caption_entities', 'photo', 'video', 'animation', 'video_note', 'sticker', 'audio', 'voice', 'document', 'rich_message', 'reply_markup', 'public_import', 'imported_media']; return Object.fromEntries(fields.filter((field) => message[field] !== undefined).map((field) => [field, message[field]])); }
 function unsupportedKind(message) { return ['rich_message', 'sticker', 'poll', 'dice', 'location', 'venue', 'contact', 'game', 'invoice', 'story', 'paid_media'].find((kind) => message[kind]) || 'без текста и вложения'; }
+function wavAudio(item) { return item.type === 'audio' && (String(item.mime || '').toLowerCase().includes('wav') || /\.wav$/i.test(String(item.name || ''))); }
+function mp3Name(name) { const stem = String(name || 'telegram-audio').replace(/\.[^.]+$/, '') || 'telegram-audio'; return `${stem}.mp3`; }
+function maxUploadError(response, body) {
+  const reason = response.headers.get('x-reason');
+  const detail = String(body || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  return [response.status, reason, detail && !/<(?:!doctype|html|head|body)\b/i.test(detail) ? detail : null].filter(Boolean).join(', ');
+}
+async function wavAsMp3(blob, name) {
+  await mkdir(MEDIA_CONVERSION_DIR, { recursive: true });
+  const directory = await mkdtemp(join(MEDIA_CONVERSION_DIR, 'wav-'));
+  const input = join(directory, 'source.wav');
+  const output = join(directory, 'audio.mp3');
+  try {
+    await writeFile(input, Buffer.from(await blob.arrayBuffer()));
+    await execFile('ffmpeg', ['-nostdin', '-v', 'error', '-y', '-i', input, '-vn', '-c:a', 'libmp3lame', '-q:a', '2', output], { timeout: 120000, maxBuffer: 1024 * 1024 });
+    return { blob: await openAsBlob(output, { type: 'audio/mpeg' }), name: mp3Name(name), cleanup: () => rm(directory, { recursive: true, force: true }) };
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw new Error(`Не удалось подготовить WAV для MAX: ${String(error.message || error).slice(0, 160)}`);
+  }
+}
 async function upload(connection, item) {
   const maxToken = unseal(connection.maxToken);
   let source;
@@ -173,24 +204,66 @@ async function upload(connection, item) {
     dataBlob = new Blob([bytes], { type: item.mime || source.headers.get('content-type') || 'application/octet-stream' });
   }
   const endpoint = await fetch(`https://platform-api2.max.ru/uploads?type=${item.type}`, { method: 'POST', headers: { Authorization: maxToken } });
-  const address = await endpoint.json();
-  if (!endpoint.ok || !address.url) throw new Error('MAX upload URL failed');
-  const data = new FormData();
-  data.append('data', dataBlob, item.name);
-  const response = await fetch(address.url, { method: 'POST', body: data });
-  const body = await response.text();
-  if (!response.ok) throw new Error('MAX media upload failed');
-  let answer = {};
-  try { answer = JSON.parse(body); } catch { /* Some MAX hosts return a plain confirmation. */ }
-  let urlToken = null;
-  try { urlToken = new URL(address.url).searchParams.get('token') || new URL(address.url).searchParams.get('apiToken'); } catch { /* MAX supplied the URL. */ }
-  const photoToken = Object.values(answer.photos || {}).map((photo) => photo?.token).find((token) => typeof token === 'string' && token);
-  const token = [answer.token, answer.upload_token, answer.payload?.token, answer.result?.token, photoToken, address.token, urlToken].find((value) => typeof value === 'string' && value);
-  if (!token) throw new Error(`MAX upload returned no token for ${item.type}`);
-  return { type: item.type, payload: { token } };
+  const endpointBody = await endpoint.text();
+  let address = {};
+  try { address = JSON.parse(endpointBody); } catch { /* MAX may return a non-JSON failure body. */ }
+  if (!endpoint.ok || !address.url) throw new Error(`MAX не выдал URL для загрузки (${maxUploadError(endpoint, endpointBody) || 'unknown error'})`);
+  const prepared = wavAudio(item) ? await wavAsMp3(dataBlob, item.name) : { blob: dataBlob, name: item.name, cleanup: null };
+  try {
+    const data = new FormData();
+    data.append('data', prepared.blob, prepared.name);
+    const response = await fetch(address.url, { method: 'POST', body: data });
+    const body = await response.text();
+    if (!response.ok) throw new Error(`MAX не загрузил ${item.type} (${maxUploadError(response, body) || 'unknown error'})`);
+    let answer = {};
+    try { answer = JSON.parse(body); } catch { /* Audio/video hosts may return an XML retval while the token came with the upload URL. */ }
+    let urlToken = null;
+    try { urlToken = new URL(address.url).searchParams.get('token') || new URL(address.url).searchParams.get('apiToken'); } catch { /* MAX supplied the URL. */ }
+    const photoToken = Object.values(answer.photos || {}).map((photo) => photo?.token).find((token) => typeof token === 'string' && token);
+    const token = [answer.token, answer.upload_token, answer.payload?.token, answer.result?.token, photoToken, address.token, urlToken].find((value) => typeof value === 'string' && value);
+    if (!token) throw new Error(`MAX upload returned no token for ${item.type}`);
+    return { type: item.type, payload: { token } };
+  } finally {
+    await prepared.cleanup?.();
+  }
 }
-const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function publish(connection, message, editMessageId = null) { if (!connection.targetChatId) throw new Error('MAX channel has not been connected'); const messages = normalizeMessages(message); const primary = primaryMessage(messages); const original = textOf(primary); const formatted = telegramMessageHtml(primary) || formatTelegram(original, tagsOf(primary)); const parts = formatted ? splitHtml(formatted) : split(original); const files = messages.flatMap(filesOf); if (!original.trim() && !files.length) throw new Error(`Тип публикации Telegram пока не поддержан: ${unsupportedKind(primary)}`); if (files.length > 12) throw new Error('MAX поддерживает не более 12 вложений в одном сообщении'); const attachments = await Promise.all(files.map((file) => upload(connection, file))); const maxToken = unseal(connection.maxToken); let maxMessageId = editMessageId; for (const [index, text] of parts.entries()) { const editing = Boolean(editMessageId && index === 0); const payload = { text, notify: true }; if (formatted) payload.format = 'html'; if (!index && attachments.length) payload.attachments = attachments; const endpoint = editing ? `https://platform-api2.max.ru/messages?message_id=${encodeURIComponent(editMessageId)}` : `https://platform-api2.max.ru/messages?chat_id=${encodeURIComponent(connection.targetChatId)}`; for (let attempt = 0; attempt < 4; attempt += 1) { const response = await fetch(endpoint, { method: editing ? 'PUT' : 'POST', headers: { Authorization: maxToken, 'content-type': 'application/json' }, body: JSON.stringify(payload) }); if (response.ok) { const body = await response.json().catch(() => ({})); maxMessageId ||= body.message?.body?.mid || body.body?.mid || body.message_id || null; break; } const detail = await response.text(); if ((response.status < 500 && !detail.includes('attachment.not.ready')) || attempt === 3) throw new Error(`MAX rejected the post (${response.status}): ${detail.slice(0, 180)}`); await pause(1500 * (attempt + 1)); } } return maxMessageId; }
+function publicationContent(message) {
+  const messages = normalizeMessages(message);
+  const original = textOf(primaryMessage(messages));
+  const formatted = telegramMessageHtml(primaryMessage(messages)) || formatTelegram(original, tagsOf(messages));
+  return { original, formatted, parts: formatted ? splitHtml(formatted) : split(original), files: messages.flatMap(filesOf) };
+}
+async function readMax(connection, path) {
+  const response = await fetch(`https://platform-api2.max.ru${path}`, { headers: { Authorization: unseal(connection.maxToken) } });
+  if (!response.ok) throw new Error(`Не удалось сверить части MAX (${response.status})`);
+  return response.json();
+}
+async function publish(connection, message, state, previousParts = []) {
+  if (!connection.targetChatId) throw new Error('MAX channel has not been connected');
+  return maxDeliveries.run(connection.targetChatId, async (send) => {
+    const { original, formatted, parts, files } = publicationContent(message);
+    if (!original.trim() && !files.length) throw new Error(`Тип публикации Telegram пока не поддержан: ${unsupportedKind(primaryMessage(message))}`);
+    if (files.length > 12) throw new Error('MAX поддерживает не более 12 вложений в одном сообщении');
+    if (state.maxMessageId && !Array.isArray(state.maxMessageIds)) {
+      if (!previousParts.length) throw new Error('Не сохранён исходник старого поста MAX; требуется сверка публикации.');
+      if (previousParts.length === 1) state.maxMessageIds = [state.maxMessageId];
+      else {
+        const anchor = await readMax(connection, `/messages/${encodeURIComponent(state.maxMessageId)}`);
+        if (!Number.isFinite(anchor.timestamp)) throw new Error('MAX не вернул дату исходной публикации.');
+        const nearby = await readMax(connection, `/messages?chat_id=${encodeURIComponent(connection.targetChatId)}&from=${anchor.timestamp - 1}&to=${anchor.timestamp + 60000}&count=100`);
+        state.maxMessageIds = recoverMaxPartIds(nearby.messages || [], state.maxMessageId, previousParts);
+      }
+      await save();
+    }
+    const attachments = await Promise.all(files.map((file) => upload(connection, file)));
+    return publishMaxParts({ parts, formatted, attachments, state, send, token: unseal(connection.maxToken), chatId: connection.targetChatId, persist: save,
+      canAppend: async (lastId) => {
+        const latest = await readMax(connection, `/messages?chat_id=${encodeURIComponent(connection.targetChatId)}&count=1`);
+        return latest.messages?.[0]?.body?.mid === lastId;
+      },
+    });
+  });
+}
 async function configure(connection) { const maxToken = unseal(connection.maxToken); await prepareTelegramConnection(connection); await telegramApi(connection, 'setWebhook', { url: `${env.baseUrl}/webhooks/telegram/${connection.id}`, secret_token: connection.telegramSecret, allowed_updates: ['channel_post', 'edited_channel_post', 'message'] }); await telegramApi(connection, 'setMyCommands', { commands: telegramAssistantCommands }); const response = await (await fetch('https://platform-api2.max.ru/subscriptions', { method: 'POST', headers: { Authorization: maxToken, 'content-type': 'application/json' }, body: JSON.stringify({ url: `${env.baseUrl}/webhooks/max/${connection.id}`, update_types: ['bot_added', 'bot_removed'], secret: connection.maxSecret }) })).json(); if (!response.success) throw new Error('MAX rejected this bot token'); connection.error = null; connection.updatedAt = stamp(); await save(); }
 async function tryConfigure(connection) { try { await configure(connection); } catch (error) { connection.error = String(error.message || error); connection.updatedAt = stamp(); await save(); } }
 
@@ -203,11 +276,13 @@ async function deliveryItem(connection, message, edited = false) {
   let item = mediaGroupId
     ? store.history.find((entry) => entry.connectionId === connection.id && entry.telegramMediaGroupId === String(mediaGroupId))
     : store.history.find((entry) => entry.connectionId === connection.id && (incomingIds.includes(entry.telegramMessageId) || entry.telegramMessageIds?.some((id) => incomingIds.includes(String(id)))));
-  const wasPublished = item?.status === 'published';
+  const wasPublished = item?.status === 'published' || item?.costKopecks !== undefined;
   const knownIds = new Set((item?.telegramMessageIds || [item?.telegramMessageId]).filter(Boolean).map(String));
   const extendsPublishedAlbum = Boolean(wasPublished && mediaGroupId && incomingIds.some((id) => !knownIds.has(id)));
   if (wasPublished && !edited && !extendsPublishedAlbum) return { item, duplicate: true, wasPublished, messages: incoming, shouldEdit: false };
   const previous = item?.sourceMessages?.length ? item.sourceMessages : item?.sourceMessage ? [item.sourceMessage] : [];
+  const previousContent = previous.length ? publicationContent(previous) : null;
+  const previousParts = previousContent?.parts.map((part) => previousContent.formatted ? plainMaxText(part) : part) || [];
   const messages = mediaGroupId && previous.length ? mergeMessages(previous, incoming) : incoming;
   const messageIds = messages.map((entry) => String(entry.message_id || '')).filter(Boolean);
   const snapshots = messages.map(snapshotMessage);
@@ -231,10 +306,33 @@ async function deliveryItem(connection, message, edited = false) {
   item.updatedAt = stamp();
   store.history = store.history.slice(0, 500);
   await save();
-  return { item, duplicate: false, wasPublished, messages, shouldEdit: edited || extendsPublishedAlbum };
+  return { item, duplicate: false, wasPublished, messages, previousParts };
 }
 async function completeDelivery(item, status, error = null, extra = {}) { item.status = status; item.error = error ? String(error.message || error).slice(0, 220) : null; item.updatedAt = stamp(); item.deliveredAt = status === 'published' ? stamp() : null; Object.assign(item, extra); await save(); }
-async function repost(connection, message, edited = false) { const { item, duplicate, wasPublished, messages, shouldEdit } = await deliveryItem(connection, message, edited); if (duplicate) return 'duplicate'; const user = store.users.find((candidate) => candidate.id === connection.userId); const price = settings().pricePerMessageKopecks; if (!user || (!wasPublished && Number(user.balanceKopecks || 0) < price)) { await completeDelivery(item, 'blocked', 'Недостаточно средств на балансе'); return 'insufficient'; } try { const maxMessageId = await publish(connection, messages, shouldEdit && wasPublished ? item.maxMessageId || null : null); if (!wasPublished) credit(user, -price, 'delivery', `Репост из @${connection.source}`, { connectionId: connection.id, telegramMessageId: item.telegramMessageId, telegramMediaGroupId: item.telegramMediaGroupId || null }); await completeDelivery(item, 'published', null, { maxMessageId, costKopecks: wasPublished ? Number(item.costKopecks || 0) : price, balanceAfterKopecks: user.balanceKopecks }); return 'published'; } catch (error) { await completeDelivery(item, 'failed', error); throw error; } }
+async function repost(connection, message, edited = false) {
+  // Serialize history lookup as well as publication, so simultaneous edits and
+  // repeated webhooks cannot both observe stale IDs or charge the same post.
+  return telegramReposts.run(connection.id, () => repostOrdered(connection, message, edited));
+}
+async function repostOrdered(connection, message, edited) {
+  const { item, duplicate, wasPublished, messages, previousParts } = await deliveryItem(connection, message, edited);
+  if (duplicate) return 'duplicate';
+  const user = store.users.find((candidate) => candidate.id === connection.userId);
+  const price = settings().pricePerMessageKopecks;
+  if (!user || (!wasPublished && Number(user.balanceKopecks || 0) < price)) {
+    await completeDelivery(item, 'blocked', 'Недостаточно средств на балансе');
+    return 'insufficient';
+  }
+  try {
+    const maxMessageIds = await publish(connection, messages, item, previousParts);
+    if (!wasPublished) credit(user, -price, 'delivery', `Репост из @${connection.source}`, { connectionId: connection.id, telegramMessageId: item.telegramMessageId, telegramMediaGroupId: item.telegramMediaGroupId || null });
+    await completeDelivery(item, 'published', null, { maxMessageId: maxMessageIds[0], maxMessageIds, costKopecks: wasPublished ? Number(item.costKopecks || 0) : price, balanceAfterKopecks: user.balanceKopecks });
+    return 'published';
+  } catch (error) {
+    await completeDelivery(item, 'failed', error);
+    throw error;
+  }
+}
 
 function savedMessages(item) {
   return normalizeMessages(item?.sourceMessages?.length ? item.sourceMessages : item?.sourceMessage ? [item.sourceMessage] : []);
@@ -296,7 +394,7 @@ async function sendImportedPost(value, connection, imported) {
 }
 
 async function replayHistoryItem(value, item, connection) {
-  if (item.status === 'processing' || historyReplays.has(item.id)) return 'busy';
+  if (item.status === 'processing' || historyReplays.has(item.id) || item.activeMaxReplay) return 'busy';
   if (!connection?.enabled || !connection.targetChatId) return 'connection';
   let messages = savedMessages(item);
   if (messages.some((message) => message.public_import)) {
@@ -311,16 +409,22 @@ async function replayHistoryItem(value, item, connection) {
   item.replayAttempts = Number(item.replayAttempts || 0) + 1;
   item.lastReplayAttemptAt = stamp();
   try {
-    const maxMessageId = await publish(connection, messages);
+    item.activeMaxReplay = {};
+    await save();
+    const maxMessageIds = await publish(connection, messages, item.activeMaxReplay);
+    const maxMessageId = maxMessageIds[0];
     credit(value.user, -price, 'delivery', `Повторный репост из @${connection.source}`, { connectionId: connection.id, telegramMessageId: item.telegramMessageId, telegramMediaGroupId: item.telegramMediaGroupId || null, historyId: item.id, replay: true, maxMessageId });
     item.replayCount = Number(item.replayCount || 0) + 1;
     item.lastReplayedAt = stamp();
     item.lastReplayMaxMessageId = maxMessageId;
+    item.lastReplayMaxMessageIds = maxMessageIds;
+    item.activeMaxReplay = null;
     item.lastReplayError = null;
     item.updatedAt = stamp();
     await save();
     return 'replayed';
   } catch (error) {
+    if (!item.activeMaxReplay?.maxMessageIds?.length && item.activeMaxReplay?.maxPendingPart == null) item.activeMaxReplay = null;
     item.lastReplayError = String(error.message || error).slice(0, 220);
     item.updatedAt = stamp();
     await save();
@@ -374,7 +478,7 @@ async function flushAlbum(key) {
         return;
       }
       const revision = group.updatedAt;
-      try { await repost(connection, group.messages, Boolean(group.edited)); } catch (error) { console.error('telegram album delivery', error.message); }
+      try { await distributePost(connection, group.messages, Boolean(group.edited)); } catch (error) { console.error('telegram album delivery', error.message); }
       const latest = store.pendingAlbums.find((entry) => mediaGroupKey(entry.connectionId, entry.mediaGroupId) === key);
       if (latest?.updatedAt !== revision) {
         latest.edited = true;
@@ -418,8 +522,17 @@ function importedPosts(item, value) {
   }).join('');
   return `<section style="margin-top:16px;padding:15px;border-radius:14px;background:#f6f8fc"><div class="panel-head" style="margin-bottom:4px"><div><h3>Последние доступные посты</h3><p class="small" style="margin:3px 0 0">Загрузка ничего не публикует. Выберите нужный пост отдельно.</p></div><span class="count">${imports.length}</span></div>${rows}</section>`;
 }
-function connectionCard(item, value) { const state = !item.enabled ? ['pause', 'Репост остановлен'] : item.targetChatId ? ['live', 'Активно'] : ['wait', 'Ожидает MAX-канал']; return `<article class="connection" id="connection-${esc(item.id)}"><div class="connection-top"><div class="connection-title"><span>${mark(23)}</span><div><h3>${esc(item.name)}</h3><p class="small">Источник: @${esc(item.source)}</p></div></div><span class="tag ${state[0]}">${state[1]}</span></div><div class="connection-meta"><span class="tag">Telegram</span><span class="small">→</span><span class="tag">MAX${item.targetChatId ? ` · ${esc(item.targetChatId)}` : ''}</span></div>${item.error ? `<p class="notice error" style="margin:12px 0 0">${esc(item.error)}</p>` : ''}<div class="actions"><form method="post" action="/connections/${item.id}/toggle"><input type="hidden" name="csrf" value="${esc(value.session.csrf)}"><button class="button small ${item.enabled ? 'danger' : ''}">${item.enabled ? 'Остановить' : 'Включить'}</button></form><form method="post" action="/connections/${item.id}/configure"><input type="hidden" name="csrf" value="${esc(value.session.csrf)}"><button class="button small outline">Обновить подключение</button></form><form method="post" action="/connections/${item.id}/import"><input type="hidden" name="csrf" value="${esc(value.session.csrf)}"><button class="button small outline">Подгрузить посты с канала</button></form></div><p class="small" style="margin:9px 0 0">Доступны последние публичные посты с текстом, фото или видео — до 12 вложений.</p><form class="credit-form" method="post" action="/connections/${item.id}/max-token" style="margin-top:13px"><input type="hidden" name="csrf" value="${esc(value.session.csrf)}"><input name="maxToken" type="password" autocomplete="off" required placeholder="Новый токен MAX"><button class="button small outline">Заменить токен MAX</button></form>${importedPosts(item, value)}</article>`; }
-function dashboard(value, notice = '', noticeError = false) { const list = store.connections.filter((item) => item.userId === value.user.id); return page('Подключения', `<main class="dashboard"><section class="head"><div><p class="eyebrow"><i></i>Личный кабинет</p><h1>Подключения</h1><p class="muted">Настраивайте направления репостов и следите за их состоянием.</p></div><a class="button" href="#new">+ Новое подключение</a></section>${notice ? `<p class="notice${noticeError ? ' error' : ''}">${esc(notice)}</p>` : ''}<section class="grid"><article class="panel"><div class="panel-head"><h2>Активные направления</h2><span class="count">${list.length}</span></div><div class="connections">${list.length ? list.map((item) => connectionCard(item, value)).join('') : '<p class="muted">Подключений ещё нет. Создайте первое ниже.</p>'}</div></article><aside class="panel help"><h2>Как это работает</h2><p>Новая публикация из Telegram появляется в MAX автоматически.</p><ol><li>Добавьте Telegram-бота администратором исходного канала.</li><li>Добавьте MAX-бота администратором целевого канала.</li><li>Создайте подключение — остальное настроится само.</li></ol></aside><article class="panel wide" id="new"><div class="panel-head"><h2>Новое подключение</h2><span class="small">Шаг 1 из 1</span></div><p class="form-intro">Telegram-бот должен быть администратором исходного канала. MAX-бота добавьте в целевой канал после создания связки.</p><form method="post" action="/connections"><input type="hidden" name="csrf" value="${esc(value.session.csrf)}"><div class="form-grid"><label class="field"><span>Название подключения</span><input name="name" maxlength="80" required placeholder="Новости компании" autocomplete="off"></label><label class="field"><span>Исходный Telegram-канал</span><input name="source" maxlength="64" required placeholder="@my_channel" autocomplete="off"></label><label class="field"><span>Токен Telegram-бота</span><input name="telegramToken" type="password" autocomplete="off" required></label><label class="field"><span>Токен MAX-бота</span><input name="maxToken" type="password" autocomplete="off" required></label><label class="field wide"><span>ID канала MAX <em class="small">необязательно</em></span><input name="targetChatId" autocomplete="off" placeholder="Оставьте пустым — определится после добавления бота"></label></div><div class="create-actions"><p class="small">Токены шифруются сразу после сохранения и не отображаются в кабинете.</p><button class="button">Создать подключение</button></div></form></article></section></main>`, value); }
+function dashboard(value, notice = '', noticeError = false, options = {}) {
+  const list = store.connections.filter((item) => item.userId === value.user.id);
+  const model = dashboardData(store, value.user.id);
+  const createForm = `<p class="form-intro">Telegram-бот должен быть администратором исходного канала. MAX-бота добавьте в целевой канал после создания связки.</p><form method="post" action="/connections"><input type="hidden" name="csrf" value="${esc(value.session.csrf)}"><div class="form-grid"><label class="field"><span>Название подключения</span><input name="name" maxlength="80" required placeholder="Новости компании" autocomplete="off"></label><label class="field"><span>Исходный Telegram-канал</span><input name="source" maxlength="64" required placeholder="@my_channel" autocomplete="off"></label><label class="field"><span>Токен Telegram-бота</span><input name="telegramToken" type="password" autocomplete="off" required></label><label class="field"><span>Токен MAX-бота</span><input name="maxToken" type="password" autocomplete="off" required></label><label class="field wide"><span>ID канала MAX <em class="small">необязательно</em></span><input name="targetChatId" autocomplete="off" placeholder="Оставьте пустым — определится после добавления бота"></label></div><div class="create-actions"><p class="small">Токены шифруются сразу после сохранения и не отображаются в кабинете.</p><button class="button">Создать подключение</button></div></form>`;
+  const content = renderDashboard(model, {
+    csrf: value.session.csrf, waState: whatsapp.client.status(value.user.id).state,
+    notice, noticeError, createForm,
+    imports: new Map(list.map((item) => [item.id, importedPosts(item, value)])), ...options,
+  });
+  return page('Обзор каналов', content, value);
+}
 function history(value, notice = '', noticeError = false) {
   const connections = store.connections.filter((item) => item.userId === value.user.id);
   const connectionById = new Map(connections.map((item) => [item.id, item]));
@@ -451,8 +564,14 @@ function legalPage(kind, value) { const legal = legalData(); const company = leg
 auth = function legalAuth(kind, message = '', returnTo = '') { const register = kind === 'register'; const safe = safeReturnTo(returnTo, ''); const hidden = safe ? `<input type="hidden" name="returnTo" value="${esc(safe)}">` : ''; const consent = register ? '<label class="small" style="display:flex;gap:8px;align-items:flex-start;color:#596680"><input name="legalConsent" type="checkbox" required style="width:16px;height:16px;margin:2px 0 0"> <span>Я принимаю <a href="/legal/offer" target="_blank">оферту</a> и соглашаюсь с <a href="/legal/privacy" target="_blank">политикой обработки данных</a>.</span></label>' : ''; return page(register ? 'Регистрация' : 'Вход', `<main class="auth"><section><p class="eyebrow"><i></i>Multi Post</p><h1>${register ? 'Создайте кабинет' : 'С возвращением'}<br><span>для ваших каналов.</span></h1><p class="muted">Доступ к настройкам получают только владельцы. Токены ботов сохраняются в зашифрованном виде.</p></section><section class="panel auth-card"><h2>${register ? 'Регистрация' : 'Вход в кабинет'}</h2><p class="small">${register ? 'При регистрации начислим приветственный баланс.' : 'Введите данные вашей учётной записи.'}</p><form class="stack" method="post" action="/${kind}">${hidden}${message ? `<p class="notice error">${esc(message)}</p>` : ''}<label class="field"><span>E-mail</span><input name="email" type="email" autocomplete="email" required></label><label class="field"><span>Пароль</span><input name="password" type="password" minlength="10" autocomplete="${register ? 'new-password' : 'current-password'}" required></label>${consent}<button class="button">${register ? 'Создать кабинет' : 'Войти'}</button></form><p class="small" style="margin:16px 0 0">${register ? 'Уже есть аккаунт? <a href="/login">Войти</a>' : 'Ещё нет аккаунта? <a href="/register">Создать кабинет</a>'}</p></section></main>`); };
 function telegramLinkPage(value, link) { return page('Привязка Telegram', `<main class="dashboard"><section class="panel" style="max-width:620px"><p class="eyebrow"><i></i>Telegram-бот</p><h1>Привязать кабинет</h1><p class="muted">Вы привязываете личный чат с @MultiPoostBot к аккаунту ${esc(value.user.email)}. После подтверждения бот сможет показывать только ваши баланс, подключения и историю репостов.</p><form method="post" action="/telegram/link" class="stack"><input type="hidden" name="csrf" value="${esc(value.session.csrf)}"><input type="hidden" name="token" value="${esc(link.token)}"><button class="button">Подтвердить привязку</button></form><p class="small" style="margin:16px 0 0">Одноразовая ссылка действует до ${historyTime(link.expiresAt)}.</p></section></main>`, value); }
 
+const whatsapp = createWhatsAppFeature({ getStore: () => store, save, page, html, go, needUser, forbidden, form, csrf, seal, unseal, directory: join(dirname(env.file), 'whatsapp'), loadMedia: createWhatsAppMediaLoader({ telegramApi, unseal, telegramRoute }), textOf, filesOf, normalizeMessages, primaryMessage, refreshedPublicMessages });
+async function distributePost(connection, messages, edited = false) {
+  const results = await Promise.allSettled([repost(connection, messages, edited), whatsapp.auto(connection, messages, edited)]);
+  if (results[0].status === 'rejected') throw results[0].reason;
+}
 const server = createServer(async (req, res) => { try { const requestUrl = typeof req.url === 'string' && req.url.startsWith('/') && !req.url.startsWith('//') ? req.url : '/'; const url = new URL(requestUrl, `http://${req.headers.host || 'localhost'}`);
-  if (req.method === 'POST' && url.pathname.startsWith('/webhooks/telegram/')) { const connection = store.connections.find((item) => item.id === url.pathname.split('/').at(-1)); if (!connection || req.headers['x-telegram-bot-api-secret-token'] !== connection.telegramSecret) { res.writeHead(401); return res.end(); } const update = JSON.parse((await raw(req, 2 * 1024 * 1024)).toString()); const post = update.channel_post || update.edited_channel_post; if (connection.enabled && post?.chat?.username?.toLowerCase() === connection.source) { try { if (post.media_group_id && fileOf(post)) await enqueueAlbum(connection, post, Boolean(update.edited_channel_post)); else await repost(connection, post, Boolean(update.edited_channel_post)); } catch (error) { console.error('telegram delivery', error.message); } } if (update.message) { try { await handleTelegramAssistant(connection, update.message); } catch (error) { console.error('telegram assistant webhook', error.message); } } res.writeHead(200); return res.end(); }
+  if (await whatsapp.handle(req, res, url)) return;
+  if (req.method === 'POST' && url.pathname.startsWith('/webhooks/telegram/')) { const connection = store.connections.find((item) => item.id === url.pathname.split('/').at(-1)); if (!connection || req.headers['x-telegram-bot-api-secret-token'] !== connection.telegramSecret) { res.writeHead(401); return res.end(); } const update = JSON.parse((await raw(req, 2 * 1024 * 1024)).toString()); const post = update.channel_post || update.edited_channel_post; if (connection.enabled && post?.chat?.username?.toLowerCase() === connection.source) { try { if (post.media_group_id && fileOf(post)) await enqueueAlbum(connection, post, Boolean(update.edited_channel_post)); else await distributePost(connection, post, Boolean(update.edited_channel_post)); } catch (error) { console.error('telegram delivery', error.message); } } if (update.message) { try { await handleTelegramAssistant(connection, update.message); } catch (error) { console.error('telegram assistant webhook', error.message); } } res.writeHead(200); return res.end(); }
   if (req.method === 'POST' && url.pathname === '/webhooks/max/app') { if (!maxAppReady() || req.headers['x-max-bot-api-secret'] !== env.maxApp.secret) { res.writeHead(401); return res.end(); } const update = JSON.parse((await raw(req, 512 * 1024)).toString()); try { await handleMaxAssistant(update); } catch (error) { console.error('max assistant webhook', error.message); } res.writeHead(200); return res.end(); }
   if (req.method === 'POST' && url.pathname.startsWith('/webhooks/max/')) { const connection = store.connections.find((item) => item.id === url.pathname.split('/').at(-1)); if (!connection || req.headers['x-max-bot-api-secret'] !== connection.maxSecret) { res.writeHead(401); return res.end(); } const update = JSON.parse((await raw(req, 2 * 1024 * 1024)).toString()); if (applyMaxTargetUpdate(connection, update)) { connection.updatedAt = stamp(); await save(); } res.writeHead(200); return res.end(); }
   if (req.method === 'GET' && url.pathname === '/healthz') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: true, users: store.users.length, connections: store.connections.length, active: store.connections.filter((item) => item.enabled && item.targetChatId).length })); }
@@ -466,7 +585,7 @@ const server = createServer(async (req, res) => { try { const requestUrl = typeo
   if (req.method === 'GET' && url.pathname === '/login') return html(res, 200, auth('login', '', safeReturnTo(url.searchParams.get('returnTo'), '')));
   if (req.method === 'POST' && url.pathname === '/login') { const data = await form(req); const returnTo = safeReturnTo(data.returnTo); const user = store.users.find((item) => item.email === (data.email || '').trim().toLowerCase()); if (!user || !await passwordOk(data.password || '', user.passwordHash)) return html(res, 401, auth('login', 'Неверный e-mail или пароль.', returnTo)); const session = await newSession(user.id); setSession(res, session); return go(res, returnTo); }
   if (req.method === 'POST' && url.pathname === '/logout') { const value = needUser(req, res); if (!value) return; const data = await form(req); if (!csrf(value, data)) return forbidden(res); store.sessions = store.sessions.filter((item) => item.id !== value.session.id); await save(); res.setHeader('set-cookie', 'session=; Path=/; HttpOnly; Secure; SameSite=None; Partitioned; Max-Age=0'); return go(res, '/'); }
-  if (req.method === 'GET' && url.pathname === '/dashboard') { const value = needUser(req, res); if (!value) return; const count = Math.max(0, Math.min(10, Number(url.searchParams.get('count')) || 0)); const feedback = { loaded: [`Подгружено последних постов: ${count}. Ничего не отправлено — выберите публикацию в списке.`, false], no_posts: ['Telegram не вернул доступных публичных постов с текстом, фото или видео.', true], sent: ['Выбранный пост отправлен в MAX. Списание отражено в балансе и истории.', false], duplicate: ['Этот пост уже был опубликован в MAX.', true], insufficient: ['Недостаточно средств для отправки выбранного поста.', true], connection: ['Подключение остановлено или MAX-канал ещё не настроен.', true], busy: ['Этот пост уже отправляется. Дождитесь завершения.', true], unavailable: ['Пост больше недоступен для отправки из публичной ленты Telegram.', true], load_failed: ['Не удалось подгрузить публичную ленту Telegram. Проверьте, что канал публичный, и повторите позже.', true], failed: ['MAX не принял выбранный пост. Подробность сохранена в истории.', true] }[url.searchParams.get('result')]; return html(res, 200, dashboard(value, feedback?.[0] || '', feedback?.[1] || false)); }
+  if (req.method === 'GET' && url.pathname === '/dashboard') { const value = needUser(req, res); if (!value) return; const count = Math.max(0, Math.min(10, Number(url.searchParams.get('count')) || 0)); const feedback = { loaded: [`Подгружено последних постов: ${count}. Ничего не отправлено — выберите публикацию в списке.`, false], no_posts: ['Telegram не вернул доступных публичных постов с текстом, фото или видео.', true], sent: ['Выбранный пост отправлен в MAX. Списание отражено в балансе и истории.', false], duplicate: ['Этот пост уже был опубликован в MAX.', true], insufficient: ['Недостаточно средств для отправки выбранного поста.', true], connection: ['Подключение остановлено или MAX-канал ещё не настроен.', true], busy: ['Этот пост уже отправляется. Дождитесь завершения.', true], unavailable: ['Пост больше недоступен для отправки из публичной ленты Telegram.', true], load_failed: ['Не удалось подгрузить публичную ленту Telegram. Проверьте, что канал публичный, и повторите позже.', true], failed: ['MAX не принял выбранный пост. Подробность сохранена в истории.', true] }[url.searchParams.get('result')]; return html(res, 200, dashboard(value, feedback?.[0] || '', feedback?.[1] || false, { month: url.searchParams.get('month'), day: url.searchParams.get('day'), view: url.searchParams.get('view'), openNew: url.searchParams.get('new') === '1', openImports: url.searchParams.get('result') === 'loaded' })); }
   if (req.method === 'GET' && url.pathname === '/history') { const value = needUser(req, res); if (!value) return; const feedback = { replayed: ['Пост повторно отправлен в MAX. Списание отражено в балансе.', false], insufficient: ['Недостаточно средств для повторной отправки.', true], unavailable: ['Повтор невозможен: сохранённый исходник не содержит текста или поддерживаемого вложения.', true], connection: ['Подключение к MAX остановлено или не настроено.', true], busy: ['Этот пост уже отправляется. Дождитесь завершения операции.', true], failed: ['MAX не принял повторную публикацию. Подробность сохранена в записи истории.', true] }[url.searchParams.get('result')]; return html(res, 200, history(value, feedback?.[0] || '', feedback?.[1] || false)); }
   const historyReplayRoute = url.pathname.match(/^\/history\/([^/]+)\/replay$/); if (req.method === 'POST' && historyReplayRoute) { const value = needUser(req, res); if (!value) return; const data = await form(req); if (!csrf(value, data)) return forbidden(res); const item = store.history.find((entry) => entry.id === historyReplayRoute[1]); const connection = item && store.connections.find((entry) => entry.id === item.connectionId && entry.userId === value.user.id); if (!item || !connection) return forbidden(res); try { return go(res, `/history?result=${await replayHistoryItem(value, item, connection)}`); } catch (error) { console.error('history replay', error.message); return go(res, '/history?result=failed'); } }
   if (req.method === 'GET' && url.pathname === '/profile') { const value = needUser(req, res); return value && html(res, 200, profile(value)); }
@@ -486,8 +605,10 @@ const server = createServer(async (req, res) => { try { const requestUrl = typeo
 } catch (error) { console.error(error); return html(res, 500, page('Ошибка', '<main class="dashboard"><h1>Не удалось выполнить действие</h1><p class="muted">Проверьте данные и повторите.</p></main>')); } });
 
 await init();
+await whatsapp.init();
 resumePendingAlbums();
 try { await configureMaxAssistant(); console.log('MAX assistant commands and webhook configured'); } catch (error) { console.error('MAX assistant setup', error.message); }
 server.listen(env.port, '127.0.0.1', () => console.log(`Multi Post is listening on 127.0.0.1:${env.port}`));
 
+server.on('close', () => { void whatsapp.close(); });
 export { server };

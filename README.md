@@ -14,7 +14,25 @@ Links in Telegram post text are sent with MAX link previews enabled. MAX generat
 
 Telegram text entities and rich-message blocks are converted to MAX HTML so supported bold, italic, underline, strikethrough, code, headings, quotations, highlights, and links keep their formatting. Long formatted posts are split into balanced HTML chunks within the MAX message limit.
 
+MAX delivery saves every confirmed part ID immediately. Telegram edits update these parts in place; shortening a post removes its obsolete trailing parts. Legacy multipart IDs are recovered only from an exact consecutive content match beside the original first message. If a historical post grows beyond its existing parts after newer posts have appeared, the edit stops rather than appending a misplaced continuation. An unconfirmed send is recorded before the request and requires channel reconciliation before another attempt; server errors never trigger blind POST retries. Repeated webhooks and edits are serialized before history lookup and charging. A failed or ambiguous partial replay remains blocked until reconciled.
+
 Large Telegram files are routed through an official local Bot API server. Set `TELEGRAM_LOCAL_API_URL`, `TELEGRAM_LOCAL_SOURCES=*`, and `TELEGRAM_LOCAL_FILE_ROOT` to make it the default for all existing and future connections; a comma-separated source allowlist is still supported when a partial rollout is needed. When a new local connection is created, the service first calls the cloud Bot API `logOut` method once and then installs the webhook through the local server. Absolute file paths are accepted only under the configured root and are streamed to MAX from disk.
+
+Telegram WAV audio is transparently transcoded to MP3 before upload: the current MAX audio upload host rejects otherwise valid WAV payloads. The production unit sets `MEDIA_CONVERSION_DIR=/var/lib/channel-reposter/transcode`; FFmpeg must be installed on the host.
+
+## Optional WhatsApp group destination
+
+Each existing connection now has a **Подключить WhatsApp** action. Pair the owner's WhatsApp account with the QR code under Linked devices, then paste an existing group invite link. The account must already belong to the group and have permission to post; the service never joins a group automatically. Saving a group leaves automatic reposting off until enabled separately.
+
+This uses the unofficial Baileys WhatsApp Web client, not Meta Cloud API. Sessions can disconnect and WhatsApp can restrict the account. During this initial integration WhatsApp delivery does not charge the balance; MAX delivery and its existing tariff are unchanged. One Telegram webhook feeds the two independent destinations. Telegram edits are not propagated to WhatsApp. Text and links are retained as plain text, followed by individual media messages; Rich Message layout and Telegram reactions are not reproduced.
+
+Pairing starts only from an authenticated, CSRF-protected POST. QR codes are owner-only and are not persisted or logged. Linked-device authentication is encrypted with `APP_ENCRYPTION_KEY` in `whatsapp/` next to `STATE_PATH` (directory mode 700, files 600). Disconnect stops this service's session and auto forwarding for that account; revoke the linked device in the phone app to revoke it at WhatsApp as well. Startup resumes only previously activated, registered accounts.
+
+**Подготовить архив Telegram** paginates the public feed without publishing. Saved webhook source payloads take priority over public snippets for posts still observed in the public feed. Service notices are excluded. Stored-only records are reported separately and never silently restored into the migration. The resulting report lists unsupported IDs and incomplete scans; it does not imply a complete Telegram export. The existing public parser supports text/photos/videos and up to 12 media items per album. Other formats need saved payloads or a separate export. **Перенести подготовленные посты** sends this reviewed set in chronological order only to WhatsApp, with original date/source URL in the text. The phone account must be connected. A paused batch can be started again: already published items are skipped. All media for each post is fetched before sending (50 files / 100 MiB total maximum).
+
+WhatsApp deliveries have a separate durable ledger, message/album deduplication, a per-account queue, and per-part message IDs. Ambiguous or partial delivery stops the batch and cannot be automatically repeated. Check the group before resolving such an entry; the current UI deliberately does not reset ambiguous entries. A restart pauses an in-progress archive transfer. Routine MAX history replay still sends only to MAX. No test messages are sent by `npm run check`.
+
+Install the pinned dependencies with `npm ci` before starting the service. The existing systemd writable state directory is sufficient; no additional externally exposed port is needed.
 
 ## Production setup
 
@@ -42,6 +60,14 @@ MAX_APP_BOT_USERNAME=se13980695_bot
 At startup the service registers the command menu and the protected webhook `https://channel.xedoc.ru/webhooks/max/app`. The bot supports `/start`, `/cabinet`, `/connect`, `/status`, and `/help`. Do not put the token into a chat, repository, or browser URL.
 
 If a MAX token is rotated, replace it for the existing repost direction using the “Заменить токен MAX” form on the connection card. The token is sealed before it is saved and its webhook subscription is refreshed automatically.
+
+## Dashboard overview
+
+`GET /dashboard` shows Telegram as the source and MAX / WhatsApp as destinations for each connection. WhatsApp status uses the current client session as well as the saved group; a saved group alone does not mean the account is connected. Setup, token rotation and archived post selection remain available in expandable sections.
+
+Statistics use the signed-in user's saved history only. Successful MAX posts include recovered replays; old MAX records do not retain a reliable multipart message count. WhatsApp counts fully published source posts and separately counts confirmed message IDs, including confirmed parts of a partial delivery. An uncertain attempt without an acknowledgment is never counted as a delivered message.
+
+The calendar supports `month=YYYY-MM`, `day=YYYY-MM-DD` and `view=posts|deliveries`. Publication dates come from Telegram and are deduplicated across destinations and album aliases. Old records without an original date use their first processing date, marked with `≈`. Delivery view uses confirmed delivery dates. Both views use `Asia/Yekaterinburg` (UTC+5), represent retained history rather than all-time analytics, and do not include future scheduling.
 
 ## Development check
 

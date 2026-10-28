@@ -7,9 +7,13 @@
     "start": "node server.js",
     "configure": "node configure-webhooks.js",
     "resolve-max-target": "node resolve-max-target.js",
-    "check": "node --check server.js && node --check media-groups.js && node --check max-target.js && node --check telegram-public.js && node --check telegram-rich.js && node --check telegram-routing.js && node --check configure-webhooks.js && node --check resolve-max-target.js && node --test media-groups.test.js max-target.test.js telegram-public.test.js telegram-rich.test.js telegram-routing.test.js server.integration.test.js"
+    "check": "node --check server.js && node --check dashboard.js && node --check dashboard-style.js && node --check media-groups.js && node --check max-target.js && node --check max-delivery.js && node --check max-publication.js && node --check telegram-public.js && node --check telegram-rich.js && node --check telegram-routing.js && node --check configure-webhooks.js && node --check resolve-max-target.js && node --check whatsapp-client.js && node --check whatsapp-delivery.js && node --check whatsapp-archive.js && node --check whatsapp-feature.js && node --check whatsapp-media.js && node --test dashboard.test.js media-groups.test.js max-target.test.js max-delivery.test.js max-publication.test.js telegram-public.test.js telegram-rich.test.js telegram-routing.test.js server.integration.test.js whatsapp-client.test.js whatsapp-delivery.test.js whatsapp-archive.test.js whatsapp-feature.test.js whatsapp-media.test.js"
   },
   "engines": {
     "node": ">=22"
+  },
+  "dependencies": {
+    "baileys": "7.0.0-rc14",
+    "qrcode": "1.5.4"
   }
 }
