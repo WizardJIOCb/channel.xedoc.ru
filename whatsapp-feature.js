@@ -164,6 +164,10 @@ export function createWhatsAppFeature(deps) {
         let result;
         try { result = await sendOne(connection, post, data.retry === 'yes'); }
         finally { sending.delete(connection.id); }
+        if (data.returnTo === 'history') {
+          const feedback = { published: 'wa_sent', uncertain: 'wa_uncertain', partial: 'wa_uncertain', processing: 'busy' }[result.status] || 'wa_failed';
+          go(res, `/history?connection=${encodeURIComponent(connection.id)}&result=${feedback}`); return true;
+        }
         html(res, 200, render(connection, value, labels[result.status] || result.status)); return true;
       } else if (action === 'batch') {
         if (tasks.has(connection.id) || preparing.has(connection.id) || configuring.has(connection.id) || sending.has(connection.id)) throw new Error('Дождитесь завершения текущей операции');
@@ -178,7 +182,10 @@ export function createWhatsAppFeature(deps) {
         const batch = store().whatsappBatches[connection.id]; if (batch) { batch.pauseRequested = true; await save(); }
       }
       go(res, pathFor(connection));
-    } catch (error) { html(res, 400, render(connection, value, String(error.message || 'Не удалось выполнить действие').slice(0, 240))); }
+    } catch (error) {
+      if (data.returnTo === 'history' && action === 'send') go(res, `/history?connection=${encodeURIComponent(connection.id)}&result=wa_failed`);
+      else html(res, 400, render(connection, value, String(error.message || 'Не удалось выполнить действие').slice(0, 240)));
+    }
     return true;
   }
   async function init() {

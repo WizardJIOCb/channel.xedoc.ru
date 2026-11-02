@@ -109,6 +109,18 @@ test('automatic WhatsApp delivery is opt-in and ignores edits', async (t) => {
   assert.equal(sent.length, 1);
 });
 
+test('a manual send from unified history returns there and never affects MAX or the wallet', async (t) => {
+  const { request, sent, store } = await fixture(t);
+  const before = JSON.stringify({ users: store.users, history: store.history, ledger: store.ledger });
+  const response = await request('/send', { csrf: 'csrf-test', messageId: '101', returnTo: 'history' });
+  assert.equal(response.status, 303);
+  assert.equal(response.headers.get('location'), '/history?connection=c1&result=wa_sent');
+  assert.equal(sent.length, 1);
+  assert.equal(JSON.stringify({ users: store.users, history: store.history, ledger: store.ledger }), before);
+  assert.equal((await request('/send', { csrf: 'csrf-test', messageId: 'unknown', returnTo: 'history' })).headers.get('location'), '/history?connection=c1&result=wa_failed');
+  assert.equal(sent.length, 1);
+});
+
 test('cannot change groups while a historical source refresh is in flight', async (t) => {
   let releaseRefresh;
   let refreshStarted;

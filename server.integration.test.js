@@ -82,6 +82,7 @@ test('two Telegram album updates become one MAX post and one charge', async (t) 
     history: [],
     ledger: [],
     pendingAlbums: [],
+    telegramImports: [{ connectionId: 'connection-1', messageId: '101', sourceMessages: [{ message_id: 101, public_import: true }, { message_id: '101-2', public_import: true }] }],
     settings: { welcomeBonusKopecks: 30000, pricePerMessageKopecks: 100 },
     migrated: true,
     connectionWebhooksMigrated: true,
@@ -142,6 +143,10 @@ test('two Telegram album updates become one MAX post and one charge', async (t) 
   assert.equal(state.ledger.filter((item) => item.type === 'delivery').length, 1);
   assert.equal(state.users[0].balanceKopecks, 400);
 
+  const duplicateImport = await postForm(port, '/connections/connection-1/imports/101/send', { csrf: 'csrf-token', returnTo: 'history' });
+  assert.equal(duplicateImport.location, '/history?connection=connection-1&result=duplicate');
+  assert.equal(maxMessages.length, 1);
+
   const historyPage = await getPage(port, '/history');
   assert.equal(historyPage.status, 200);
   assert.match(historyPage.body, new RegExp(`/history/${state.history[0].id}/replay`));
@@ -182,16 +187,20 @@ test('loading public Telegram posts is non-publishing and each post can be sent 
   }, null, 2)}\n`);
 
   const publicPage = `<div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message" data-post="source_channel/700"><div class="tgme_widget_message_text js-message_text">Праздник в садике</div><a class="tgme_widget_message_photo_wrap js-message_photo" href="https://t.me/source_channel/700" style="background-image:url('https://cdn4.telesco.pe/file/test-photo.jpg')"></a><time datetime="2026-08-26T08:00:00+00:00"></time></div></div>`;
+  const olderPage = publicPage.replaceAll('/700', '/699').replace('Праздник в садике', 'Более ранний пост');
+  const latestPage = publicPage + '<a class="js-messages_more" href="/s/source_channel?before=700"></a>';
   process.env.APP_ENCRYPTION_KEY = key.toString('base64');
   process.env.PUBLIC_BASE_URL = 'https://channel.example.test';
   process.env.STATE_PATH = statePath;
   process.env.PORT = '0';
 
   const maxMessages = [];
+  let sourceReads = 0;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input, options = {}) => {
     const url = String(input);
-    if (url === 'https://t.me/s/source_channel' || url === 'https://t.me/source_channel/700?embed=1&mode=tme') return new Response(publicPage, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+    if (url === 'https://t.me/s/source_channel' || url === 'https://t.me/s/source_channel/700') { sourceReads++; return new Response(latestPage, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } }); }
+    if (url === 'https://t.me/s/source_channel?before=700') { sourceReads++; return new Response(olderPage); }
     if (url === 'https://cdn4.telesco.pe/file/test-photo.jpg') return new Response(Buffer.from('fake public image bytes'), { status: 200, headers: { 'content-type': 'image/jpeg' } });
     if (url.startsWith('https://platform-api2.max.ru/uploads?')) return new Response(JSON.stringify({ url: 'https://upload.example.test/public-import' }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (url === 'https://upload.example.test/public-import') return new Response(JSON.stringify({ token: 'uploaded-public-image' }), { status: 200, headers: { 'content-type': 'application/json' } });
@@ -211,6 +220,20 @@ test('loading public Telegram posts is non-publishing and each post can be sent 
   });
 
   const port = server.address().port;
+  const automatic = await getPage(port, '/history');
+  assert.equal(automatic.status, 200);
+  assert.match(automatic.body, /Праздник в садике/);
+  assert.match(automatic.body, /Отправить в MAX/);
+  assert.equal(maxMessages.length, 0);
+  assert.equal(sourceReads, 1);
+  await getPage(port, '/history/fragment');
+  assert.equal(sourceReads, 1);
+  assert.equal((await getPage(port, '/history?connection=not-owned')).status, 403);
+  assert.equal((await postForm(port, '/history/refresh', { csrf: 'bad' })).status, 403);
+  const cached = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(cached.history.length, 0);
+  assert.equal(cached.ledger.length, 0);
+  assert.equal(cached.users[0].balanceKopecks, 500);
   const loaded = await postForm(port, '/connections/connection-1/import', { csrf: 'csrf-token' });
   assert.deepEqual(loaded, { status: 303, location: '/dashboard?result=loaded&count=1#connection-connection-1' });
   assert.equal(maxMessages.length, 0);
@@ -245,6 +268,18 @@ test('loading public Telegram posts is non-publishing and each post can be sent 
   assert.equal(sentState.history[0].status, 'published');
   assert.equal(sentState.ledger.filter((item) => item.type === 'delivery').length, 1);
   assert.equal(sentState.users[0].balanceKopecks, 400);
+  const again = await postForm(port, '/connections/connection-1/imports/700/send', { csrf: 'csrf-token', returnTo: 'history' });
+  assert.equal(again.location, '/history?connection=connection-1&result=duplicate');
+  assert.equal(maxMessages.length, 1);
+  assert.equal(sourceReads, 2);
+  assert.equal((await postForm(port, '/history/more', { csrf: 'csrf-token', connection: 'connection-1' })).status, 303);
+  const olderState = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(olderState.telegramImports.length, 2);
+  const olderHistory = await getPage(port, '/history?filter=new');
+  assert.match(olderHistory.body, /Более ранний пост/);
+  assert.equal(sourceReads, 3);
+  assert.equal(maxMessages.length, 1);
+  assert.equal(olderState.users[0].balanceKopecks, 400);
 });
 
 test('a Telegram rich message is preserved and published to MAX', async (t) => {

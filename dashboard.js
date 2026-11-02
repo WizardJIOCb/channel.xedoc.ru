@@ -8,6 +8,8 @@ const messageWord = (n) => plural(n, 'сообщение', 'сообщения',
 const eventWord = (n, mode) => mode === 'posts' ? plural(n, 'публикация', 'публикации', 'публикаций') : plural(n, 'доставка', 'доставки', 'доставок');
 const number = (v) => new Intl.NumberFormat('ru-RU').format(v);
 const validDate = (v) => { const d = new Date(typeof v === 'number' ? v * 1000 : v); return v && !Number.isNaN(+d) ? d.toISOString() : null; };
+// Acknowledgment only clears the saved failure; a later update must count again.
+const unacknowledgedIssue = (row) => !validDate(row.issueAcknowledgedAt) || (validDate(row.updatedAt) && validDate(row.updatedAt) > validDate(row.issueAcknowledgedAt));
 export const dashboardDay = (v) => validDate(v) ? new Intl.DateTimeFormat('sv-SE', { timeZone: ZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(validDate(v))) : null;
 const time = (v) => v ? new Intl.DateTimeFormat('ru-RU', { timeZone: ZONE, day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }).format(new Date(v)) : 'Ещё нет доставок';
 
@@ -61,7 +63,7 @@ export function dashboardData(store, userId, now = new Date()) {
         metrics.get(row.connectionId).maxLast = latest(metrics.get(row.connectionId).maxLast, date);
       }
     }
-    if (['failed', 'blocked'].includes(row.status) && !row.lastReplayMaxMessageId) metrics.get(row.connectionId).issues++;
+    if (['failed', 'blocked'].includes(row.status) && !row.lastReplayMaxMessageId && unacknowledgedIssue(row)) metrics.get(row.connectionId).issues++;
   }
   for (const row of store.whatsappDeliveries || []) {
     if (!owned.has(row.connectionId) || (row.userId && row.userId !== userId)) continue;
@@ -84,7 +86,7 @@ export function dashboardData(store, userId, now = new Date()) {
         stats.waLast = latest(stats.waLast, date);
       }
     }
-    if (['failed', 'partial', 'uncertain'].includes(row.status)) stats.issues++;
+    if (['failed', 'partial', 'uncertain'].includes(row.status) && unacknowledgedIssue(row)) stats.issues++;
   }
   for (const row of store.telegramImports || []) {
     postFor(row, row.messageId, [row.publishedAt, ...(row.sourceMessages || []).map((m) => m.date)], row.preview, (row.sourceMessages || []).map((m) => m.message_id));
@@ -98,7 +100,7 @@ export function dashboardData(store, userId, now = new Date()) {
   const uniqueDeliveries = deliveries.filter((delivery, index) => deliveries.findIndex((d) => d.post === delivery.post && d.platform === delivery.platform) === index);
   const channels = connections.map((c) => ({
     id: c.id, name: c.name, source: c.source, enabled: Boolean(c.enabled), telegramConfigured: Boolean(c.telegramToken), maxConfigured: Boolean(c.maxToken),
-    target: c.targetChatId || '', error: c.error || '', whatsapp: { groupName: c.whatsapp?.groupName || '', hasGroup: Boolean(c.whatsapp?.groupId), enabled: Boolean(c.whatsapp?.enabled) },
+    target: c.targetChatId || '', sharedMax: c.maxMode === 'shared', error: c.error || '', whatsapp: { groupName: c.whatsapp?.groupName || '', hasGroup: Boolean(c.whatsapp?.groupId), enabled: Boolean(c.whatsapp?.enabled) },
     ...metrics.get(c.id),
   }));
   return { channels, posts, deliveries: uniqueDeliveries, today: dashboardDay(now.toISOString()), totals: channels.reduce((a, c) => ({ max: a.max + c.max, whatsapp: a.whatsapp + c.waPosts, messages: a.messages + c.messages, issues: a.issues + c.issues }), { max: 0, whatsapp: 0, messages: 0, issues: 0 }) };
@@ -131,7 +133,7 @@ function channelCard(c, csrf, waState, imports, openImports) {
         ${badge(c.error ? 'Требует внимания' : !maxReady ? 'Не подключено' : c.enabled ? 'Подключено' : 'Репост на паузе', c.error || !maxReady ? 'warning' : c.enabled ? 'good' : 'muted')}
         <strong class="ov-destination">${c.target ? `Канал ${esc(c.target)}` : 'Выберите канал MAX'}</strong>
         <p class="ov-caption">${number(c.max)} ${postWord(c.max)} ${plural(c.max, 'доставлен', 'доставлено', 'доставлено')}<br>Последний: ${esc(time(c.maxLast))}</p>
-        <div class="ov-platform-bottom">${maxReady ? postForm(`${base}/toggle`, csrf, c.enabled ? 'Приостановить репост' : 'Возобновить репост', 'quiet') : postForm(`${base}/configure`, csrf, 'Подключить MAX')}
+        <div class="ov-platform-bottom">${maxReady ? postForm(`${base}/toggle`, csrf, c.enabled ? 'Приостановить репост' : 'Возобновить репост', 'quiet') : c.sharedMax ? `<a class="ov-button primary" href="${base}/max">Подключить MAX</a>` : postForm(`${base}/configure`, csrf, 'Подключить MAX')}
         <details class="ov-settings"><summary>Настройки MAX</summary>${c.error ? `<p class="ov-error">${esc(c.error)}</p>` : ''}${postForm(`${base}/configure`, csrf, 'Обновить подключение', 'quiet')}
         <form method="post" action="${base}/max-token"><input type="hidden" name="csrf" value="${esc(csrf)}"><label>Новый токен MAX<input name="maxToken" type="password" autocomplete="new-password" required placeholder="Токен бота"></label><button class="ov-button">Заменить токен MAX</button></form></details></div>
       </section>

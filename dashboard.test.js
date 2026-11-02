@@ -28,6 +28,30 @@ test('dashboard isolates owners, counts confirmed parts and preserves recovered 
   assert.doesNotMatch(JSON.stringify(model), /PRIVATE/);
 });
 
+test('acknowledged failures leave delivery evidence intact and newer failures count again', () => {
+  const store = fixture();
+  store.history = [{ connectionId: 'c1', telegramMessageId: 1, status: 'failed', error: 'MAX failure', updatedAt: '2026-10-27T10:00:00Z' }];
+  store.whatsappDeliveries = [{ connectionId: 'c1', telegramMessageId: 2, status: 'partial', error: 'WA failure', sentMessageIds: ['confirmed'], updatedAt: '2026-10-27T10:00:00Z' }];
+  const before = dashboardData(store, 'u1', now);
+  assert.equal(before.totals.issues, 2);
+  for (const row of [...store.history, ...store.whatsappDeliveries]) row.issueAcknowledgedAt = now.toISOString();
+  const acknowledged = structuredClone(store);
+  const after = dashboardData(store, 'u1', now);
+  assert.equal(after.totals.issues, 0);
+  assert.equal(after.channels[0].issues, 0);
+  assert.deepEqual(after.posts, before.posts);
+  assert.deepEqual(after.deliveries, before.deliveries);
+  assert.equal(after.totals.messages, 1);
+  assert.equal(after.totals.max, 0);
+  assert.equal(after.totals.whatsapp, 0);
+  assert.deepEqual(store, acknowledged);
+  for (const row of [...store.history, ...store.whatsappDeliveries]) row.updatedAt = '2026-10-28T08:00:00Z';
+  assert.equal(dashboardData(store, 'u1', now).totals.issues, 2);
+  store.history[0].issueAcknowledgedAt = 'invalid';
+  store.history[0].updatedAt = '2026-10-27T10:00:00Z';
+  assert.equal(dashboardData(store, 'u1', now).totals.issues, 2);
+});
+
 test('albums and duplicate records count once across destinations, including late alias bridges', () => {
   const store = fixture();
   store.history = [1, 2].map((id) => ({ connectionId: 'c1', telegramMessageId: id, status: 'published', createdAt: now.toISOString() }));

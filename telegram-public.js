@@ -126,17 +126,37 @@ export function parseTelegramPublicPosts(html, expectedSource) {
   }).filter(Boolean);
 }
 
-export async function fetchTelegramPublicPosts(source, messageId = null, fetchImpl = fetch) {
+async function telegramPublicHtml(source, messageId, fetchImpl, before = null) {
   const channel = String(source || '').replace(/^@/, '').trim().toLowerCase();
   if (!/^[a-z0-9_]{5,64}$/i.test(channel)) throw new Error('Некорректное имя Telegram-канала');
   const postId = messageId == null ? null : String(messageId);
   if (postId !== null && !/^\d+$/.test(postId)) throw new Error('Некорректный ID Telegram-поста');
-  const url = postId ? `https://t.me/${channel}/${postId}?embed=1&mode=tme` : `https://t.me/s/${channel}`;
+  if (before !== null && !/^\d{1,16}$/.test(String(before))) throw new Error('Некорректная страница Telegram');
+  const url = postId ? `https://t.me/s/${channel}/${postId}` : `https://t.me/s/${channel}${before === null ? '' : `?before=${before}`}`;
   const response = await fetchImpl(url, { headers: { 'user-agent': 'Mozilla/5.0 (compatible; MultiPost/1.0)' }, signal: AbortSignal.timeout(12000) });
   if (!response.ok) throw new Error(`Telegram не открыл публичную ленту (${response.status})`);
   const length = Number(response.headers.get('content-length') || 0);
   if (length > TELEGRAM_PAGE_LIMIT) throw new Error('Страница Telegram слишком большая');
   const html = await response.text();
   if (Buffer.byteLength(html) > TELEGRAM_PAGE_LIMIT) throw new Error('Страница Telegram слишком большая');
+  return { html, channel };
+}
+
+export async function fetchTelegramPublicPosts(source, messageId = null, fetchImpl = fetch) {
+  const { html, channel } = await telegramPublicHtml(source, messageId, fetchImpl);
   return parseTelegramPublicPosts(html, channel);
+}
+
+export async function fetchTelegramPublicPage(source, { before = null, fetchImpl = fetch } = {}) {
+  const { html, channel } = await telegramPublicHtml(source, null, fetchImpl, before);
+  let nextBefore = null;
+  for (const tag of html.match(/<a\b[^>]*>/gi) || []) {
+    if (!/\bjs-messages_more\b/.test(attribute(tag, 'class'))) continue;
+    try {
+      const url = new URL(attribute(tag, 'href'), 'https://t.me');
+      const cursor = url.searchParams.get('before');
+      if (url.origin === 'https://t.me' && url.pathname === `/s/${channel}` && /^\d{1,16}$/.test(cursor || '') && (before === null || BigInt(cursor) < BigInt(before))) nextBefore = cursor;
+    } catch { /* Ignore invalid pagination links. */ }
+  }
+  return { posts: parseTelegramPublicPosts(html, channel), nextBefore };
 }

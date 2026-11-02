@@ -30,6 +30,14 @@ test('routes every source locally when the wildcard is configured', () => {
   assert.equal(usesLocalTelegram({ source: 'future_channel' }, routing), true);
 });
 
+test('a shared connection keeps its bot local after inheriting the anchor transport', () => {
+  const routing = telegramRouting({ TELEGRAM_LOCAL_API_URL: 'http://127.0.0.1:8081', TELEGRAM_LOCAL_SOURCES: 'original_channel' });
+  const child = { source: 'another_channel', telegramApiMode: 'local' };
+  assert.equal(usesLocalTelegram(child, routing), true);
+  assert.equal(telegramBotUrl(child, 'common', 'getFile', routing), 'http://127.0.0.1:8081/botcommon/getFile');
+  assert.equal(telegramFileUrl(child, 'common', 'photo.jpg', routing), 'http://127.0.0.1:8081/file/botcommon/photo.jpg');
+});
+
 test('accepts local Bot API files only inside its configured data directory', () => {
   const routing = telegramRouting({
     TELEGRAM_LOCAL_API_URL: 'http://127.0.0.1:8081',
